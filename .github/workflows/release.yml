@@ -1,0 +1,161 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+      - deps.lock.json
+      - cmd/releasepack/**
+      - internal/distribution/**
+      - install.sh
+      - install.ps1
+      - .github/workflows/release.yml
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            cloudflared: cloudflared-darwin-amd64.tgz
+          - goos: darwin
+            goarch: arm64
+            cloudflared: cloudflared-darwin-arm64.tgz
+          - goos: linux
+            goarch: amd64
+            cloudflared: cloudflared-linux-amd64
+          - goos: linux
+            goarch: arm64
+            cloudflared: cloudflared-linux-arm64
+          - goos: windows
+            goarch: amd64
+            cloudflared: cloudflared-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            cloudflared: cloudflared-windows-arm64.exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Read locked versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "codexlink=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+          echo "cloudflared=$(jq -r '.cloudflared.version' deps.lock.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build CodexLink
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          VERSION: ${{ steps.versions.outputs.codexlink }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage dist
+          suffix=""
+          if [[ "$GOOS" == windows ]]; then suffix=".exe"; fi
+          go build -trimpath -ldflags "-s -w -X github.com/joeykchen/codexlink/internal/buildinfo.Version=$VERSION" -o "stage/codexlink${suffix}" ./cmd/codexlink
+
+      - name: Download and verify cloudflared
+        shell: bash
+        env:
+          CLOUDFLARED_VERSION: ${{ steps.versions.outputs.cloudflared }}
+          CLOUDFLARED_ASSET: ${{ matrix.cloudflared }}
+          TARGET_OS: ${{ matrix.goos }}
+        run: |
+          set -euo pipefail
+          metadata="$(curl -fsSL --retry 3 "https://api.github.com/repos/cloudflare/cloudflared/releases/tags/$CLOUDFLARED_VERSION")"
+          url="$(jq -r --arg name "$CLOUDFLARED_ASSET" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$metadata")"
+          digest="$(jq -r --arg name "$CLOUDFLARED_ASSET" '.assets[] | select(.name == $name) | .digest // empty' <<<"$metadata")"
+          test -n "$url"
+          curl -fsSL --retry 3 "$url" -o "/tmp/$CLOUDFLARED_ASSET"
+          if [[ "$digest" != sha256:* ]]; then
+            echo "cloudflared asset has no SHA-256 digest" >&2
+            exit 1
+          fi
+          expected="${digest#sha256:}"
+          actual="$(sha256sum "/tmp/$CLOUDFLARED_ASSET" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          if [[ "$CLOUDFLARED_ASSET" == *.tgz ]]; then
+            tar -xzf "/tmp/$CLOUDFLARED_ASSET" -C /tmp
+            cp /tmp/cloudflared stage/cloudflared
+          elif [[ "$TARGET_OS" == windows ]]; then
+            cp "/tmp/$CLOUDFLARED_ASSET" stage/cloudflared.exe
+          else
+            cp "/tmp/$CLOUDFLARED_ASSET" stage/cloudflared
+          fi
+          chmod 755 stage/cloudflared* stage/codexlink*
+
+      - name: Create deterministic release package
+        shell: bash
+        env:
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$TARGET_OS" == windows ]]; then suffix=".exe"; fi
+          go run ./cmd/releasepack \
+            --os "$TARGET_OS" \
+            --arch "$TARGET_ARCH" \
+            --output dist \
+            --codexlink "stage/codexlink${suffix}" \
+            --cloudflared "stage/cloudflared${suffix}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Add source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          git archive --format=tar.gz --prefix="codexlink-${version}/" -o dist/codexlink-source.tar.gz HEAD
+          sha256sum dist/codexlink-source.tar.gz | sed 's#dist/##' > dist/codexlink-source.tar.gz.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          tag="v${version}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "CodexLink ${version}" --generate-notes
+          fi
+          gh release upload "$tag" dist/* --clobber

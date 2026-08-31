@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "cloudflared": {
+    "repository": "cloudflare/cloudflared",
+    "version": "2026.8.3"
+  }
+}

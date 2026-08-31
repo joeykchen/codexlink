@@ -1,0 +1,9 @@
+/bin/
+/dist/
+/codexlink
+/cxl
+/.import/
+/.update/
+/.refactor/
+*.tmp
+.DS_Store
