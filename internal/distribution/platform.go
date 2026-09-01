@@ -20,7 +20,6 @@ var supportedTargets = map[Target]struct{}{
 	{OS: "linux", Arch: "amd64"}:   {},
 	{OS: "linux", Arch: "arm64"}:   {},
 	{OS: "windows", Arch: "amd64"}: {},
-	{OS: "windows", Arch: "arm64"}: {},
 }
 
 func CurrentTarget() (Target, error) {

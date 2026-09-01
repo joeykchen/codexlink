@@ -83,7 +83,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	}
 	verifier := strings.Repeat("q", 64)
 	audience := server.LocalBaseURL() + "/mcp"
-	code, _ := server.AuthStore.CreateAuthorizationCode(client.ID, client.RedirectURIs[0], auth.PKCEChallenge(verifier), []string{"workspace.read"}, "pair", audience)
+	code, _ := server.AuthStore.CreateAuthorizationCode(auth.AuthorizationCodeRequest{ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: auth.PKCEChallenge(verifier), Scopes: []string{"workspace.read"}, PairingID: "pair", Audience: audience, RefreshAllowed: true})
 	tokens, err := server.AuthStore.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, audience)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestSetupStatusTracksOnlyTheCurrentMCPAudience(t *testing.T) {
 	}
 	verifier := strings.Repeat("w", 64)
 	issue := func(audience string) {
-		code, err := server.AuthStore.CreateAuthorizationCode(client.ID, client.RedirectURIs[0], auth.PKCEChallenge(verifier), []string{"workspace.read"}, "pair", audience)
+		code, err := server.AuthStore.CreateAuthorizationCode(auth.AuthorizationCodeRequest{ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: auth.PKCEChallenge(verifier), Scopes: []string{"workspace.read"}, PairingID: "pair", Audience: audience, RefreshAllowed: true})
 		if err != nil {
 			t.Fatal(err)
 		}

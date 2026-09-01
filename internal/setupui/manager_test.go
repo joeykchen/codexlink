@@ -104,3 +104,25 @@ func TestManagerReportsAuthorizationProgress(t *testing.T) {
 		t.Fatalf("connected body = %s", body)
 	}
 }
+
+func TestManagerReportsAuthorizationFailure(t *testing.T) {
+	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+	manager := New(func(Session) Status {
+		return Status{State: StateFailed, Message: "token exchange failed"}
+	})
+	manager.now = func() time.Time { return now }
+	session, err := manager.Create(Session{
+		WorkspaceName: "demo", ConnectorName: "CodexLink · demo", ConnectorAction: "create",
+		MCPURL: "https://example.test/mcp", PairingCode: "ABCD-EFGH", ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/setup/"+session.ID+"/status", nil)
+	request.RemoteAddr = "127.0.0.1:51000"
+	response := httptest.NewRecorder()
+	manager.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"state":"failed"`) || !strings.Contains(response.Body.String(), `"message":"token exchange failed"`) {
+		t.Fatalf("failure status = %d %s", response.Code, response.Body.String())
+	}
+}

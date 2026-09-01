@@ -49,7 +49,7 @@ func modernMeta(version string) map[string]any {
 		protocolVersionMetaKey: version,
 		clientInfoMetaKey: map[string]any{
 			"name":    "test-client",
-			"version": "1.0.0",
+			"version": "test",
 		},
 		clientCapabilitiesMetaKey: map[string]any{},
 	}

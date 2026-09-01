@@ -1,13 +1,17 @@
 GO ?= go
 BINARY ?= codexlink
 VERSION ?= $(shell tr -d '\r\n' < VERSION)
+VERSION_PACKAGE := github.com/joeykchen/codexlink/internal/buildinfo.Version
 
-.PHONY: all build test vet race check install install-dev install-test clean
+.PHONY: all build fmt-check test vet race version-test check full-check install install-dev install-test clean
 
-all: check build
+all: full-check build
 
 build:
-	$(GO) build -trimpath -ldflags "-s -w -X github.com/joeykchen/codexlink/internal/buildinfo.Version=$(VERSION)" -o bin/$(BINARY) ./cmd/codexlink
+	$(GO) build -trimpath -ldflags "-s -w -X $(VERSION_PACKAGE)=$(VERSION)" -o bin/$(BINARY) ./cmd/codexlink
+
+fmt-check:
+	@test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
 test:
 	$(GO) test ./...
@@ -18,7 +22,12 @@ vet:
 race:
 	$(GO) test -race ./...
 
-check: test vet
+version-test:
+	./scripts/test-version.sh
+
+check: fmt-check test vet version-test
+
+full-check: check race install-test
 
 install:
 	./install.sh

@@ -29,12 +29,29 @@ type PairingResult struct {
 	AttemptsLeft int
 }
 
+type PairingState string
+
+const (
+	PairingStateIdle        PairingState = "idle"
+	PairingStateActive      PairingState = "active"
+	PairingStateConsumed    PairingState = "consumed"
+	PairingStateExpired     PairingState = "expired"
+	PairingStateLocked      PairingState = "locked"
+	PairingStateInvalidated PairingState = "invalidated"
+)
+
+type PairingStatus struct {
+	State     PairingState
+	ChangedAt time.Time
+}
+
 type PairingOptions struct {
-	TTL         time.Duration
-	MaxAttempts int
-	IPLimit     int
-	IPWindow    time.Duration
-	Now         func() time.Time
+	TTL           time.Duration
+	MaxAttempts   int
+	IPLimit       int
+	IPWindow      time.Duration
+	MaxTrackedIPs int
+	Now           func() time.Time
 }
 
 type pairingSession struct {
@@ -51,18 +68,20 @@ type ipCounter struct {
 }
 
 type PairingManager struct {
-	mu          sync.Mutex
-	workspaceID string
-	ttl         time.Duration
-	maxAttempts int
-	ipLimit     int
-	ipWindow    time.Duration
-	now         func() time.Time
-	session     *pairingSession
-	ipHits      map[string]ipCounter
+	mu            sync.Mutex
+	ttl           time.Duration
+	maxAttempts   int
+	ipLimit       int
+	ipWindow      time.Duration
+	maxTrackedIPs int
+	now           func() time.Time
+	session       *pairingSession
+	state         PairingState
+	changedAt     time.Time
+	ipHits        map[string]ipCounter
 }
 
-func NewPairingManager(workspaceID string, options PairingOptions) *PairingManager {
+func NewPairingManager(_ string, options PairingOptions) *PairingManager {
 	if options.TTL <= 0 {
 		options.TTL = 5 * time.Minute
 	}
@@ -75,17 +94,20 @@ func NewPairingManager(workspaceID string, options PairingOptions) *PairingManag
 	if options.IPWindow <= 0 {
 		options.IPWindow = time.Minute
 	}
+	if options.MaxTrackedIPs <= 0 {
+		options.MaxTrackedIPs = 2048
+	}
 	if options.Now == nil {
 		options.Now = time.Now
 	}
 	return &PairingManager{
-		workspaceID: workspaceID,
-		ttl:         options.TTL,
-		maxAttempts: options.MaxAttempts,
-		ipLimit:     options.IPLimit,
-		ipWindow:    options.IPWindow,
-		now:         options.Now,
-		ipHits:      make(map[string]ipCounter),
+		ttl:           options.TTL,
+		maxAttempts:   options.MaxAttempts,
+		ipLimit:       options.IPLimit,
+		ipWindow:      options.IPWindow,
+		maxTrackedIPs: options.MaxTrackedIPs,
+		now:           options.Now,
+		ipHits:        make(map[string]ipCounter),
 	}
 }
 
@@ -114,14 +136,23 @@ func randomString(alphabet string, length int) (string, error) {
 }
 
 func normalizePairingCode(value string) string {
-	value = strings.ToUpper(value)
-	var builder strings.Builder
+	value = strings.ToUpper(strings.TrimSpace(value))
+	switch len(value) {
+	case 8:
+	case 9:
+		if value[4] != '-' {
+			return ""
+		}
+		value = value[:4] + value[5:]
+	default:
+		return ""
+	}
 	for _, r := range value {
-		if strings.ContainsRune(pairingAlphabet, r) {
-			builder.WriteRune(r)
+		if !strings.ContainsRune(pairingAlphabet, r) {
+			return ""
 		}
 	}
-	return builder.String()
+	return value
 }
 
 func (m *PairingManager) Create() (code string, expiresAt time.Time, err error) {
@@ -137,6 +168,8 @@ func (m *PairingManager) Create() (code string, expiresAt time.Time, err error) 
 	hash := sha256.Sum256([]byte(raw))
 	m.mu.Lock()
 	m.session = &pairingSession{ID: sessionID, Hash: hash, CreatedAt: now, ExpiresAt: now.Add(m.ttl), AttemptsLeft: m.maxAttempts}
+	m.state = PairingStateActive
+	m.changedAt = now
 	m.mu.Unlock()
 	return raw[:4] + "-" + raw[4:], now.Add(m.ttl), nil
 }
@@ -145,8 +178,16 @@ func (m *PairingManager) allowIPLocked(ip string, now time.Time) bool {
 	if ip == "" {
 		return true
 	}
+	for address, counter := range m.ipHits {
+		if !now.Before(counter.ResetAt) {
+			delete(m.ipHits, address)
+		}
+	}
 	counter, ok := m.ipHits[ip]
-	if !ok || !now.Before(counter.ResetAt) {
+	if !ok {
+		if len(m.ipHits) >= m.maxTrackedIPs {
+			return false
+		}
 		m.ipHits[ip] = ipCounter{Count: 1, ResetAt: now.Add(m.ipWindow)}
 		return true
 	}
@@ -167,43 +208,58 @@ func (m *PairingManager) Verify(input, ip string) PairingResult {
 	if m.session == nil {
 		return PairingResult{Failure: PairingNoSession}
 	}
-	if now.After(m.session.ExpiresAt) {
+	if !now.Before(m.session.ExpiresAt) {
 		m.session = nil
+		m.state = PairingStateExpired
+		m.changedAt = now
 		return PairingResult{Failure: PairingExpired}
 	}
 	if m.session.AttemptsLeft <= 0 {
 		m.session = nil
+		m.state = PairingStateLocked
+		m.changedAt = now
 		return PairingResult{Failure: PairingTooManyAttempts}
 	}
 	match := subtle.ConstantTimeCompare(inputHash[:], m.session.Hash[:]) == 1
 	if match {
 		id := m.session.ID
 		m.session = nil
+		m.state = PairingStateConsumed
+		m.changedAt = now
 		return PairingResult{OK: true, SessionID: id}
 	}
 	m.session.AttemptsLeft--
 	if m.session.AttemptsLeft <= 0 {
 		m.session = nil
+		m.state = PairingStateLocked
+		m.changedAt = now
 		return PairingResult{Failure: PairingTooManyAttempts}
 	}
 	return PairingResult{Failure: PairingInvalid, AttemptsLeft: m.session.AttemptsLeft}
 }
 
-func (m *PairingManager) Active() bool {
+func (m *PairingManager) Active() bool { return m.Status().State == PairingStateActive }
+
+func (m *PairingManager) Status() PairingStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session == nil {
-		return false
-	}
-	if m.now().After(m.session.ExpiresAt) {
+	now := m.now()
+	if m.session != nil && !now.Before(m.session.ExpiresAt) {
 		m.session = nil
-		return false
+		m.state = PairingStateExpired
+		m.changedAt = now
 	}
-	return true
+	state := m.state
+	if state == "" {
+		state = PairingStateIdle
+	}
+	return PairingStatus{State: state, ChangedAt: m.changedAt}
 }
 
 func (m *PairingManager) Invalidate() {
 	m.mu.Lock()
 	m.session = nil
+	m.state = PairingStateInvalidated
+	m.changedAt = m.now()
 	m.mu.Unlock()
 }

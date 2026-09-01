@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -15,6 +16,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/joeykchen/codexlink/internal/buildinfo"
+)
+
+const (
+	maxClientMetadataURIBytes     = 2048
+	maxClientMetadataNameBytes    = 1024
+	maxClientMetadataValueBytes   = 128
+	maxClientMetadataRedirectURIs = 32
+	maxClientMetadataValues       = 16
+	maxClientMetadataScopeBytes   = 4096
 )
 
 // ClientMetadata is the registration surface shared by Dynamic Client
@@ -34,6 +46,9 @@ type ClientMetadata struct {
 }
 
 func (m ClientMetadata) normalized() (ClientMetadata, error) {
+	if err := m.validateBounds(); err != nil {
+		return ClientMetadata{}, err
+	}
 	m.ClientID = strings.TrimSpace(m.ClientID)
 	m.ClientName = truncateRunes(strings.TrimSpace(m.ClientName), 200)
 	m.TokenEndpointAuthMethod = strings.TrimSpace(m.TokenEndpointAuthMethod)
@@ -96,6 +111,67 @@ func (m ClientMetadata) normalized() (ClientMetadata, error) {
 	return m, nil
 }
 
+func (m ClientMetadata) validateBounds() error {
+	uriFields := []struct {
+		name  string
+		value string
+	}{
+		{"client_id", m.ClientID},
+		{"client_uri", m.ClientURI},
+		{"logo_uri", m.LogoURI},
+	}
+	for _, field := range uriFields {
+		if len(field.value) > maxClientMetadataURIBytes {
+			return fmt.Errorf("%s exceeds %d bytes", field.name, maxClientMetadataURIBytes)
+		}
+	}
+	if len(m.ClientName) > maxClientMetadataNameBytes {
+		return fmt.Errorf("client_name exceeds %d bytes", maxClientMetadataNameBytes)
+	}
+	if len(m.Scope) > maxClientMetadataScopeBytes {
+		return fmt.Errorf("scope exceeds %d bytes", maxClientMetadataScopeBytes)
+	}
+	if len(m.RedirectURIs) > maxClientMetadataRedirectURIs {
+		return fmt.Errorf("redirect_uris exceeds %d entries", maxClientMetadataRedirectURIs)
+	}
+	for _, redirect := range m.RedirectURIs {
+		if len(redirect) > maxClientMetadataURIBytes {
+			return fmt.Errorf("redirect URI exceeds %d bytes", maxClientMetadataURIBytes)
+		}
+	}
+	valueFields := []struct {
+		name   string
+		values []string
+	}{
+		{"grant_types", m.GrantTypes},
+		{"response_types", m.ResponseTypes},
+		{"token_endpoint_auth_methods_supported", m.TokenEndpointAuthMethodsSupported},
+	}
+	for _, field := range valueFields {
+		if len(field.values) > maxClientMetadataValues {
+			return fmt.Errorf("%s exceeds %d entries", field.name, maxClientMetadataValues)
+		}
+		for _, value := range field.values {
+			if len(value) > maxClientMetadataValueBytes {
+				return fmt.Errorf("%s contains a value longer than %d bytes", field.name, maxClientMetadataValueBytes)
+			}
+		}
+	}
+	scalarFields := []struct {
+		name  string
+		value string
+	}{
+		{"token_endpoint_auth_method", m.TokenEndpointAuthMethod},
+		{"application_type", m.ApplicationType},
+	}
+	for _, field := range scalarFields {
+		if len(field.value) > maxClientMetadataValueBytes {
+			return fmt.Errorf("%s exceeds %d bytes", field.name, maxClientMetadataValueBytes)
+		}
+	}
+	return nil
+}
+
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
@@ -137,16 +213,18 @@ func (f ClientMetadataResolverFunc) Resolve(ctx context.Context, clientID string
 type metadataCacheEntry struct {
 	client    Client
 	expiresAt time.Time
+	lastUsed  time.Time
 }
 
 // HTTPClientMetadataResolver fetches client metadata with a deliberately
 // restrictive network policy. It rejects redirects, non-HTTPS identifiers and
 // destinations that resolve to local/private/reserved addresses.
 type HTTPClientMetadataResolver struct {
-	Resolver *net.Resolver
-	Now      func() time.Time
-	Timeout  time.Duration
-	CacheTTL time.Duration
+	Resolver        *net.Resolver
+	Now             func() time.Time
+	Timeout         time.Duration
+	CacheTTL        time.Duration
+	MaxCacheEntries int
 
 	mu    sync.Mutex
 	cache map[string]metadataCacheEntry
@@ -154,11 +232,12 @@ type HTTPClientMetadataResolver struct {
 
 func NewHTTPClientMetadataResolver() *HTTPClientMetadataResolver {
 	return &HTTPClientMetadataResolver{
-		Resolver: net.DefaultResolver,
-		Now:      time.Now,
-		Timeout:  8 * time.Second,
-		CacheTTL: 5 * time.Minute,
-		cache:    make(map[string]metadataCacheEntry),
+		Resolver:        net.DefaultResolver,
+		Now:             time.Now,
+		Timeout:         8 * time.Second,
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 128,
+		cache:           make(map[string]metadataCacheEntry),
 	}
 }
 
@@ -167,6 +246,7 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 	if err != nil {
 		return Client{}, err
 	}
+	r.mu.Lock()
 	if r.Now == nil {
 		r.Now = time.Now
 	}
@@ -179,15 +259,25 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 	if r.CacheTTL <= 0 {
 		r.CacheTTL = 5 * time.Minute
 	}
-
-	r.mu.Lock()
-	if cached, ok := r.cache[clientID]; ok && r.Now().Before(cached.expiresAt) {
+	if r.MaxCacheEntries <= 0 {
+		r.MaxCacheEntries = 128
+	}
+	if r.cache == nil {
+		r.cache = make(map[string]metadataCacheEntry)
+	}
+	nowFunc, resolver := r.Now, r.Resolver
+	timeout, cacheTTL, maxCacheEntries := r.Timeout, r.CacheTTL, r.MaxCacheEntries
+	now := nowFunc()
+	r.pruneCacheLocked(now)
+	if cached, ok := r.cache[clientID]; ok {
+		cached.lastUsed = now
+		r.cache[clientID] = cached
 		r.mu.Unlock()
-		return cached.client, nil
+		return cloneClient(cached.client), nil
 	}
 	r.mu.Unlock()
 
-	addresses, err := r.Resolver.LookupIPAddr(ctx, parsed.Hostname())
+	addresses, err := resolver.LookupIPAddr(ctx, parsed.Hostname())
 	if err != nil || len(addresses) == 0 {
 		if err == nil {
 			err = errors.New("client metadata host has no addresses")
@@ -210,6 +300,7 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 		IdleConnTimeout:       10 * time.Second,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
+	defer transport.CloseIdleConnections()
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 10 * time.Second}
 	transport.DialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
 		_, port, splitErr := net.SplitHostPort(address)
@@ -228,7 +319,7 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   r.Timeout,
+		Timeout:   timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -238,7 +329,7 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 		return Client{}, err
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "CodexLink/1.0")
+	request.Header.Set("User-Agent", buildinfo.ProductName+"/"+buildinfo.Version)
 	response, err := client.Do(request)
 	if err != nil {
 		return Client{}, fmt.Errorf("fetch client metadata: %w", err)
@@ -256,7 +347,7 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 		return Client{}, fmt.Errorf("client metadata document is too large")
 	}
 	var metadata ClientMetadata
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&metadata); err != nil {
 		return Client{}, fmt.Errorf("invalid client metadata JSON: %w", err)
 	}
@@ -281,16 +372,46 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 		GrantTypes:              metadata.GrantTypes,
 		ResponseTypes:           metadata.ResponseTypes,
 		ApplicationType:         metadata.ApplicationType,
-		CreatedAt:               r.Now().UTC().Format(time.RFC3339Nano),
+		CreatedAt:               nowFunc().UTC().Format(time.RFC3339Nano),
 	}
+	now = nowFunc()
 	r.mu.Lock()
-	r.cache[clientID] = metadataCacheEntry{client: resolved, expiresAt: r.Now().Add(r.CacheTTL)}
+	r.pruneCacheLocked(now)
+	if len(r.cache) >= maxCacheEntries {
+		r.evictOldestLocked()
+	}
+	r.cache[clientID] = metadataCacheEntry{client: cloneClient(resolved), expiresAt: now.Add(cacheTTL), lastUsed: now}
 	r.mu.Unlock()
-	return resolved, nil
+	return cloneClient(resolved), nil
+}
+
+func (r *HTTPClientMetadataResolver) pruneCacheLocked(now time.Time) {
+	for key, entry := range r.cache {
+		if !now.Before(entry.expiresAt) {
+			delete(r.cache, key)
+		}
+	}
+}
+
+func (r *HTTPClientMetadataResolver) evictOldestLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range r.cache {
+		if oldestKey == "" || entry.lastUsed.Before(oldest) || (entry.lastUsed.Equal(oldest) && key < oldestKey) {
+			oldestKey, oldest = key, entry.lastUsed
+		}
+	}
+	if oldestKey != "" {
+		delete(r.cache, oldestKey)
+	}
 }
 
 func parseMetadataClientID(clientID string) (*url.URL, error) {
-	parsed, err := url.Parse(strings.TrimSpace(clientID))
+	clientID = strings.TrimSpace(clientID)
+	if len(clientID) > maxClientMetadataURIBytes {
+		return nil, fmt.Errorf("client_id exceeds %d bytes", maxClientMetadataURIBytes)
+	}
+	parsed, err := url.Parse(clientID)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, fmt.Errorf("client_id is not a valid HTTPS metadata URL")
 	}

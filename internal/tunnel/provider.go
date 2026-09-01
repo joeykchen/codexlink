@@ -1,11 +1,10 @@
 package tunnel
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,6 +65,9 @@ func ParseQuickURL(line string) string {
 }
 
 func NewQuickProvider(logger *logging.Logger) Provider {
+	if logger == nil {
+		logger = logging.Null()
+	}
 	return &processProvider{
 		name: "cloudflare-quick", binary: FindBinary("cloudflared"), logger: logger, timeout: 45 * time.Second,
 		args: func(port int) []string {
@@ -76,6 +78,9 @@ func NewQuickProvider(logger *logging.Logger) Provider {
 }
 
 func NewNamedProvider(tunnelName, hostname string, logger *logging.Logger) (Provider, error) {
+	if logger == nil {
+		logger = logging.Null()
+	}
 	hostname, err := NormalizeHostname(hostname)
 	if err != nil {
 		return nil, err
@@ -109,6 +114,12 @@ func ProviderForState(state State, logger *logging.Logger) (Provider, error) {
 func (p *processProvider) Name() string { return p.name }
 
 func (p *processProvider) Start(ctx context.Context, localPort int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if localPort < 1 || localPort > 65535 {
+		return "", fmt.Errorf("invalid local port %d", localPort)
+	}
 	p.mu.Lock()
 	if p.cmd != nil {
 		if p.url != "" {
@@ -127,54 +138,44 @@ func (p *processProvider) Start(ctx context.Context, localPort int) (string, err
 		return "", fmt.Errorf("NEED_CLOUDFLARED: cloudflared is not installed")
 	}
 	command := exec.Command(p.binary, p.args(localPort)...)
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		p.mu.Unlock()
-		return "", err
+	readyCh := make(chan string, 1)
+	exitCh := make(chan error, 1)
+
+	p.url = ""
+	p.lastError = ""
+	generation := p.generation + 1
+	handleLine := func(line string) {
+		if url, ok := p.ready(line); ok {
+			select {
+			case readyCh <- url:
+			default:
+			}
+		}
+		if cloudflaredErrorRE.MatchString(line) {
+			p.mu.Lock()
+			if p.generation == generation {
+				p.lastError = truncate(line, 400)
+			}
+			p.mu.Unlock()
+			p.logger.Debug("cloudflared: %s", truncate(line, 400))
+		}
 	}
-	stderr, err := command.StderrPipe()
-	if err != nil {
-		p.mu.Unlock()
-		return "", err
-	}
+	stdout := newLineWriter(handleLine)
+	stderr := newLineWriter(handleLine)
+	command.Stdout = stdout
+	command.Stderr = stderr
 	if err := command.Start(); err != nil {
 		p.mu.Unlock()
 		return "", err
 	}
+	p.generation = generation
 	p.cmd = command
-	p.url = ""
-	p.lastError = ""
-	p.generation++
-	generation := p.generation
 	p.mu.Unlock()
 
-	readyCh := make(chan string, 1)
-	exitCh := make(chan error, 1)
-	scan := func(reader io.Reader) {
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if url, ok := p.ready(line); ok {
-				select {
-				case readyCh <- url:
-				default:
-				}
-			}
-			if cloudflaredErrorRE.MatchString(line) {
-				p.mu.Lock()
-				if p.generation == generation {
-					p.lastError = truncate(line, 400)
-				}
-				p.mu.Unlock()
-				p.logger.Debug("cloudflared: %s", truncate(line, 400))
-			}
-		}
-	}
-	go scan(stdout)
-	go scan(stderr)
 	go func() {
 		waitErr := command.Wait()
+		stdout.Flush()
+		stderr.Flush()
 		p.mu.Lock()
 		if p.generation == generation && p.cmd == command {
 			p.cmd = nil
@@ -189,10 +190,14 @@ func (p *processProvider) Start(ctx context.Context, localPort int) (string, err
 	select {
 	case url := <-readyCh:
 		p.mu.Lock()
-		if p.generation == generation && p.cmd == command {
+		active := p.generation == generation && p.cmd == command
+		if active {
 			p.url = url
 		}
 		p.mu.Unlock()
+		if !active {
+			return "", fmt.Errorf("%s tunnel stopped while starting", p.name)
+		}
 		p.logger.Info("%s tunnel established at %s", p.name, url)
 		return url, nil
 	case waitErr := <-exitCh:
@@ -272,6 +277,76 @@ func (p *processProvider) errorDetail() string {
 	return p.lastError
 }
 
+const maxTunnelLineBytes = 64 << 10
+
+type lineWriter struct {
+	pending    []byte
+	discarding bool
+	onLine     func(string)
+}
+
+func newLineWriter(onLine func(string)) *lineWriter {
+	return &lineWriter{onLine: onLine}
+}
+
+func (w *lineWriter) Write(data []byte) (int, error) {
+	written := len(data)
+	for len(data) > 0 {
+		if w.discarding {
+			newline := bytes.IndexByte(data, '\n')
+			if newline < 0 {
+				return written, nil
+			}
+			w.discarding = false
+			data = data[newline+1:]
+			continue
+		}
+
+		newline := bytes.IndexByte(data, '\n')
+		segment := data
+		complete := false
+		if newline >= 0 {
+			segment = data[:newline]
+			complete = true
+		}
+
+		remaining := maxTunnelLineBytes - len(w.pending)
+		if len(segment) > remaining {
+			w.pending = append(w.pending, segment[:remaining]...)
+			w.emitPending()
+			if !complete {
+				w.discarding = true
+				return written, nil
+			}
+		} else {
+			w.pending = append(w.pending, segment...)
+		}
+
+		if !complete {
+			return written, nil
+		}
+		w.emitPending()
+		data = data[newline+1:]
+	}
+	return written, nil
+}
+
+func (w *lineWriter) Flush() {
+	if !w.discarding {
+		w.emitPending()
+	}
+	w.pending = nil
+	w.discarding = false
+}
+
+func (w *lineWriter) emitPending() {
+	if len(w.pending) == 0 {
+		return
+	}
+	w.onLine(strings.TrimSuffix(string(w.pending), "\r"))
+	w.pending = nil
+}
+
 func truncate(value string, max int) string {
 	if len(value) <= max {
 		return value
@@ -294,8 +369,8 @@ func FindBinary(name string) string {
 		filepath.Join(`C:\Program Files\cloudflared`, executable), filepath.Join(`C:\Program Files (x86)\cloudflared`, executable),
 	}
 	for _, candidate := range candidates {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate
+		if found, err := exec.LookPath(candidate); err == nil {
+			return found
 		}
 	}
 	return ""

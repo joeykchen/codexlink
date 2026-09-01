@@ -3,10 +3,13 @@ package buildinfo
 const (
 	ProductName          = "CodexLink"
 	ServiceName          = "codexlink-bridge"
-	Version              = "1.0.0"
 	ModernProtocol       = "2026-07-28"
 	LatestLegacyProtocol = "2025-11-25"
 )
+
+// Version is overridden by release builds with -ldflags -X. Development
+// builds intentionally report "dev" so stale packaging metadata is visible.
+var Version = "dev"
 
 // SupportedProtocolVersions lists the modern stateless protocol first, then
 // the Streamable HTTP revisions supported through the legacy initialize flow.

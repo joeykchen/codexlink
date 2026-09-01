@@ -3,8 +3,9 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 DIST=${DIST_DIR:-"$ROOT/dist"}
-VERSION=${VERSION:-1.0.0}
-LDFLAGS=${LDFLAGS:-"-s -w"}
+VERSION=${VERSION:-$(tr -d '\r\n' < "$ROOT/VERSION")}
+VERSION_PACKAGE=github.com/joeykchen/codexlink/internal/buildinfo.Version
+LDFLAGS=${LDFLAGS:-"-s -w -X $VERSION_PACKAGE=$VERSION"}
 
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -25,7 +26,6 @@ build linux arm64 ""
 build darwin amd64 ""
 build darwin arm64 ""
 build windows amd64 ".exe"
-build windows arm64 ".exe"
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$DIST" && sha256sum codexlink_* > SHA256SUMS)

@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,7 +10,7 @@ import (
 	"time"
 )
 
-func TestStorePKCEResourceBindingRefreshRotationAndPersistence(t *testing.T) {
+func TestStorePKCEResourceBindingRefreshRotationAndReplayRevocation(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	file := filepath.Join(t.TempDir(), "auth.json")
 	store, err := NewStore("ws-1", StoreOptions{File: file, Now: func() time.Time { return now }, AccessTokenTTL: time.Minute})
@@ -30,7 +32,10 @@ func TestStorePKCEResourceBindingRefreshRotationAndPersistence(t *testing.T) {
 	}
 	verifier := strings.Repeat("v", 64)
 	audience := "https://bridge.example/mcp"
-	code, err := store.CreateAuthorizationCode(client.ID, client.RedirectURIs[0], PKCEChallenge(verifier), []string{"workspace.read", "offline_access"}, "pair", audience)
+	code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read", "offline_access"}, PairingID: "pair", Audience: audience, RefreshAllowed: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,14 +60,8 @@ func TestStorePKCEResourceBindingRefreshRotationAndPersistence(t *testing.T) {
 	if rotated.RefreshToken == "" || rotated.RefreshToken == set.RefreshToken {
 		t.Fatal("refresh token was not rotated")
 	}
-	if _, err := store.Refresh(set.RefreshToken, client.ID, audience); err == nil || err.Error() != "invalid_grant" {
-		t.Fatalf("old refresh should fail: %v", err)
-	}
-	if data, err := os.ReadFile(file); err != nil {
-		t.Fatal(err)
-	} else if strings.Contains(string(data), set.AccessToken) || strings.Contains(string(data), rotated.RefreshToken) {
-		t.Fatal("raw token leaked into persisted state")
-	}
+
+	// Rotation is persisted before replay handling.
 	reloaded, err := NewStore("ws-1", StoreOptions{File: file, Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
@@ -70,30 +69,85 @@ func TestStorePKCEResourceBindingRefreshRotationAndPersistence(t *testing.T) {
 	if _, err := reloaded.VerifyAccess(rotated.AccessToken, audience); err != nil {
 		t.Fatalf("persisted token unavailable: %v", err)
 	}
-	now = now.Add(2 * time.Hour)
-	if _, err := store.VerifyAccess(rotated.AccessToken, audience); err == nil || err.Error() != "expired" {
-		t.Fatalf("expired token error = %v", err)
+	if data, err := os.ReadFile(file); err != nil {
+		t.Fatal(err)
+	} else if strings.Contains(string(data), set.AccessToken) || strings.Contains(string(data), rotated.RefreshToken) {
+		t.Fatal("raw token leaked into persisted state")
 	}
-	if count := store.TokenCount(); count != 1 {
-		// The access token has expired, while the rotated refresh token remains
-		// live and is enough for an existing client to reconnect.
-		t.Fatalf("live token count = %d, want 1", count)
+
+	// Replaying the consumed refresh token revokes the entire token family.
+	if _, err := store.Refresh(set.RefreshToken, client.ID, audience); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("old refresh should fail: %v", err)
+	}
+	if _, err := store.VerifyAccess(rotated.AccessToken, audience); err == nil {
+		t.Fatal("rotated access token survived refresh replay")
+	}
+	if _, err := store.Refresh(rotated.RefreshToken, client.ID, audience); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("rotated refresh token survived family revocation: %v", err)
+	}
+	reloaded, err = NewStore("ws-1", StoreOptions{File: file, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloaded.VerifyAccess(rotated.AccessToken, audience); err == nil {
+		t.Fatal("family revocation was not persisted")
+	}
+	if count := store.TokenCount(); count != 0 {
+		t.Fatalf("live token count = %d, want 0", count)
 	}
 }
 
-func TestAuthorizationCodeIsSingleUse(t *testing.T) {
+func TestAuthorizationCodeIsSingleUseAndRedirectBound(t *testing.T) {
 	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	client, _ := store.RegisterClient("client", []string{"http://127.0.0.1/callback"})
 	verifier := strings.Repeat("a", 64)
-	code, _ := store.CreateAuthorizationCode(client.ID, client.RedirectURIs[0], PKCEChallenge(verifier), []string{"workspace.read"}, "pair", "http://127.0.0.1:1/mcp")
+	request := AuthorizationCodeRequest{
+		ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read"}, PairingID: "pair", Audience: "http://127.0.0.1:1/mcp", RefreshAllowed: true,
+	}
+	code, _ := store.CreateAuthorizationCode(request)
+	if _, err := store.ExchangeAuthorizationCode(code, client.ID, "", verifier, ""); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("missing redirect URI error = %v", err)
+	}
+
+	code, _ = store.CreateAuthorizationCode(request)
 	if _, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, ""); err == nil || err.Error() != "invalid_grant" {
+	if _, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, ""); !errors.Is(err, ErrInvalidGrant) {
 		t.Fatalf("second exchange error = %v", err)
+	}
+}
+
+func TestClientWithoutRefreshGrantDoesNotReceiveRefreshToken(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := store.RegisterClientMetadata(ClientMetadata{
+		ClientName: "code-only", RedirectURIs: []string{"https://client.example/callback"},
+		GrantTypes: []string{"authorization_code"}, ResponseTypes: []string{"code"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := strings.Repeat("g", 64)
+	code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read", "offline_access"}, Audience: "https://bridge.example/mcp", RefreshAllowed: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.RefreshToken != "" {
+		t.Fatal("refresh token issued to code-only client")
 	}
 }
 
@@ -108,7 +162,10 @@ func TestTokenCountsAndRevocationAreAudienceScoped(t *testing.T) {
 	}
 	issue := func(audience string) {
 		verifier := strings.Repeat("a", 43)
-		code, err := store.CreateAuthorizationCode(client.ID, client.RedirectURIs[0], PKCEChallenge(verifier), []string{"workspace.read", "offline_access"}, "pair", audience)
+		code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+			ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+			Scopes: []string{"workspace.read", "offline_access"}, PairingID: "pair", Audience: audience, RefreshAllowed: true,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -130,5 +187,168 @@ func TestTokenCountsAndRevocationAreAudienceScoped(t *testing.T) {
 	}
 	if store.TokenCountForAudience("https://one.example/mcp") != 0 || store.TokenCountForAudience("https://two.example/mcp") != 2 {
 		t.Fatal("audience revocation affected the wrong token family")
+	}
+}
+
+func TestParseScopesRejectsPrivilegeEscalation(t *testing.T) {
+	defaults, err := ParseScopes("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsScope(defaults, "offline_access") {
+		t.Fatal("offline_access must be explicit")
+	}
+	if _, err := ParseScopes("unknown"); !errors.Is(err, ErrInvalidScope) {
+		t.Fatalf("unknown scope error = %v", err)
+	}
+	parsed, err := ParseScopes("workspace.read workspace.read git.read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(parsed, " "); got != "workspace.read git.read" {
+		t.Fatalf("deduplicated scopes = %q", got)
+	}
+}
+
+func TestStoreBoundsClientsCodesAndStateFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "auth.json")
+	store, err := NewStore("ws", StoreOptions{File: file, MaxClients: 2, MaxAuthorizationCodes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.RegisterClient("one", []string{"https://one.example/callback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterClient("two", []string{"https://two.example/callback"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterClient("three", []string{"https://three.example/callback"}); err != nil {
+		t.Fatal(err)
+	}
+	if store.ClientCount() != 2 {
+		t.Fatalf("client count = %d", store.ClientCount())
+	}
+	if _, ok := store.Client(first.ID); ok {
+		t.Fatal("oldest unused client was not evicted")
+	}
+	client, _ := store.RegisterClient("four", []string{"https://four.example/callback"})
+	request := AuthorizationCodeRequest{ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(strings.Repeat("x", 64)), Scopes: []string{"workspace.read"}, Audience: "https://bridge.example/mcp"}
+	if _, err := store.CreateAuthorizationCode(request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAuthorizationCode(request); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("authorization code capacity error = %v", err)
+	}
+
+	oversized := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(oversized, make([]byte, 1025), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore("ws", StoreOptions{File: oversized, MaxStateBytes: 1024}); err == nil {
+		t.Fatal("oversized state was accepted")
+	}
+}
+
+func TestLegacyRefreshTokenStateRemainsUsable(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	file := filepath.Join(t.TempDir(), "auth.json")
+	refresh := "legacy-refresh"
+	state := persistedState{
+		Clients: []Client{{
+			ID: "legacy-client", RedirectURIs: []string{"https://client.example/callback"},
+			GrantTypes: []string{"authorization_code", "refresh_token"}, CreatedAt: now.UTC().Format(time.RFC3339),
+		}},
+		Tokens: []TokenRecord{{
+			Hash: hashValue(refresh), Kind: "refresh", ClientID: "legacy-client", WorkspaceID: "ws",
+			Audience: "https://bridge.example/mcp", Scopes: []string{"workspace.read", "offline_access"},
+			FamilyID: "legacy-family", IssuedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Hour).UnixMilli(),
+		}},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore("ws", StoreOptions{File: file, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := store.Refresh(refresh, "legacy-client", "https://bridge.example/mcp")
+	if err != nil {
+		t.Fatalf("legacy refresh token was not migrated: %v", err)
+	}
+	if set.RefreshToken == "" {
+		t.Fatal("migrated refresh session did not rotate")
+	}
+}
+
+func TestRevokeInvalidatesTheWholeTokenFamily(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "auth.json")
+	store, err := NewStore("ws", StoreOptions{File: file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := store.RegisterClient("client", []string{"https://client.example/callback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := strings.Repeat("r", 64)
+	audience := "https://bridge.example/mcp"
+	code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read", "offline_access"}, Audience: audience, RefreshAllowed: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, audience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke(set.AccessToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.VerifyAccess(set.AccessToken, audience); err == nil {
+		t.Fatal("revoked access token remained valid")
+	}
+	if _, err := store.Refresh(set.RefreshToken, client.ID, audience); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("related refresh token remained valid: %v", err)
+	}
+	if count := store.TokenCount(); count != 0 {
+		t.Fatalf("token family still has %d records", count)
+	}
+	reloaded, err := NewStore("ws", StoreOptions{File: file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := reloaded.TokenCount(); count != 0 {
+		t.Fatalf("family revocation was not persisted: %d records", count)
+	}
+}
+
+func TestClientLookupReturnsDefensiveCopy(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := store.RegisterClientMetadata(ClientMetadata{
+		ClientName: "test", RedirectURIs: []string{"https://example.com/callback"},
+		GrantTypes: []string{"authorization_code", "refresh_token"}, ResponseTypes: []string{"code"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := store.Client(registered.ID)
+	if !ok {
+		t.Fatal("registered client not found")
+	}
+	first.RedirectURIs[0] = "https://attacker.example/callback"
+	first.GrantTypes[0] = "attacker"
+	second, ok := store.Client(registered.ID)
+	if !ok || second.RedirectURIs[0] != "https://example.com/callback" || second.GrantTypes[0] != "authorization_code" {
+		t.Fatalf("stored client was mutated through a returned value: %+v", second)
 	}
 }

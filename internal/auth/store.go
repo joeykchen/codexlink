@@ -6,9 +6,11 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,6 +21,14 @@ import (
 	statefs "github.com/joeykchen/codexlink/internal/state"
 )
 
+var (
+	ErrInvalidGrant  = errors.New("invalid_grant")
+	ErrInvalidClient = errors.New("invalid_client")
+	ErrInvalidTarget = errors.New("invalid_target")
+	ErrInvalidScope  = errors.New("invalid_scope")
+	ErrCapacity      = errors.New("temporarily_unavailable")
+)
+
 var SupportedScopes = []string{
 	"workspace.read",
 	"workspace.search",
@@ -26,6 +36,24 @@ var SupportedScopes = []string{
 	"execution.read",
 	"offline_access",
 }
+
+// DefaultScopes deliberately excludes offline_access. A client receives a
+// refresh token only when it explicitly requests that scope and declares the
+// refresh_token grant.
+var DefaultScopes = []string{
+	"workspace.read",
+	"workspace.search",
+	"git.read",
+	"execution.read",
+}
+
+const (
+	defaultMaxClients            = 256
+	defaultMaxTokens             = 4096
+	defaultMaxAuthorizationCodes = 256
+	defaultMaxRefreshTombstones  = 4096
+	defaultMaxStateBytes         = int64(8 << 20)
+)
 
 type Client struct {
 	ID                      string   `json:"clientId"`
@@ -39,53 +67,84 @@ type Client struct {
 }
 
 type TokenRecord struct {
-	Hash        string   `json:"hash"`
-	Kind        string   `json:"kind"`
-	ClientID    string   `json:"clientId"`
-	WorkspaceID string   `json:"workspaceId"`
-	Audience    string   `json:"audience"`
-	Scopes      []string `json:"scopes"`
-	FamilyID    string   `json:"familyId,omitempty"`
-	IssuedAt    int64    `json:"issuedAt"`
-	ExpiresAt   int64    `json:"expiresAt"`
+	Hash           string   `json:"hash"`
+	Kind           string   `json:"kind"`
+	ClientID       string   `json:"clientId"`
+	WorkspaceID    string   `json:"workspaceId"`
+	Audience       string   `json:"audience"`
+	Scopes         []string `json:"scopes"`
+	FamilyID       string   `json:"familyId,omitempty"`
+	RefreshAllowed bool     `json:"refreshAllowed,omitempty"`
+	IssuedAt       int64    `json:"issuedAt"`
+	ExpiresAt      int64    `json:"expiresAt"`
+}
+
+type refreshTombstone struct {
+	Hash      string `json:"hash"`
+	FamilyID  string `json:"familyId"`
+	Audience  string `json:"audience"`
+	ExpiresAt int64  `json:"expiresAt"`
 }
 
 type authorizationCode struct {
-	Hash          string
-	ClientID      string
-	RedirectURI   string
-	CodeChallenge string
-	Scopes        []string
-	WorkspaceID   string
-	PairingID     string
-	Audience      string
-	ExpiresAt     time.Time
+	Hash           string
+	ClientID       string
+	RedirectURI    string
+	CodeChallenge  string
+	Scopes         []string
+	WorkspaceID    string
+	PairingID      string
+	Audience       string
+	RefreshAllowed bool
+	ExpiresAt      time.Time
+}
+
+type AuthorizationCodeRequest struct {
+	ClientID       string
+	RedirectURI    string
+	CodeChallenge  string
+	Scopes         []string
+	PairingID      string
+	Audience       string
+	RefreshAllowed bool
 }
 
 type persistedState struct {
-	Clients []Client      `json:"clients"`
-	Tokens  []TokenRecord `json:"tokens"`
+	Clients           []Client           `json:"clients"`
+	Tokens            []TokenRecord      `json:"tokens"`
+	RefreshTombstones []refreshTombstone `json:"refreshTombstones,omitempty"`
 }
 
 type StoreOptions struct {
-	File            string
-	Now             func() time.Time
-	AccessTokenTTL  time.Duration
-	RefreshTokenTTL time.Duration
-	AuthCodeTTL     time.Duration
+	File                  string
+	Now                   func() time.Time
+	AccessTokenTTL        time.Duration
+	RefreshTokenTTL       time.Duration
+	AuthCodeTTL           time.Duration
+	MaxClients            int
+	MaxTokens             int
+	MaxAuthorizationCodes int
+	MaxRefreshTombstones  int
+	MaxStateBytes         int64
 }
 
 type Store struct {
-	mu              sync.RWMutex
-	workspaceID     string
-	file            string
-	now             func() time.Time
-	accessTokenTTL  time.Duration
-	refreshTokenTTL time.Duration
-	authCodeTTL     time.Duration
-	clients         map[string]Client
-	tokens          map[string]TokenRecord
-	codes           map[string]authorizationCode
+	mu                    sync.RWMutex
+	workspaceID           string
+	file                  string
+	now                   func() time.Time
+	accessTokenTTL        time.Duration
+	refreshTokenTTL       time.Duration
+	authCodeTTL           time.Duration
+	maxClients            int
+	maxTokens             int
+	maxAuthorizationCodes int
+	maxRefreshTombstones  int
+	maxStateBytes         int64
+	clients               map[string]Client
+	tokens                map[string]TokenRecord
+	codes                 map[string]authorizationCode
+	refreshTombstones     map[string]refreshTombstone
 }
 
 type TokenSet struct {
@@ -105,6 +164,64 @@ type Principal struct {
 }
 
 func NewStore(workspaceID string, options StoreOptions) (*Store, error) {
+	applyStoreDefaults(workspaceID, &options)
+	if info, err := os.Stat(options.File); err == nil && info.Size() > options.MaxStateBytes {
+		return nil, fmt.Errorf("auth state exceeds %d bytes", options.MaxStateBytes)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	store := &Store{
+		workspaceID:           workspaceID,
+		file:                  options.File,
+		now:                   options.Now,
+		accessTokenTTL:        options.AccessTokenTTL,
+		refreshTokenTTL:       options.RefreshTokenTTL,
+		authCodeTTL:           options.AuthCodeTTL,
+		maxClients:            options.MaxClients,
+		maxTokens:             options.MaxTokens,
+		maxAuthorizationCodes: options.MaxAuthorizationCodes,
+		maxRefreshTombstones:  options.MaxRefreshTombstones,
+		maxStateBytes:         options.MaxStateBytes,
+		clients:               make(map[string]Client),
+		tokens:                make(map[string]TokenRecord),
+		codes:                 make(map[string]authorizationCode),
+		refreshTombstones:     make(map[string]refreshTombstone),
+	}
+	var state persistedState
+	found, err := statefs.ReadJSONFile(options.File, &state)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return store, nil
+	}
+	if len(state.Clients) > store.maxClients || len(state.Tokens) > store.maxTokens || len(state.RefreshTombstones) > store.maxRefreshTombstones {
+		return nil, fmt.Errorf("auth state exceeds configured capacity")
+	}
+	now := options.Now().UnixMilli()
+	for _, client := range state.Clients {
+		store.clients[client.ID] = client
+	}
+	for _, token := range state.Tokens {
+		if token.ExpiresAt <= now {
+			continue
+		}
+		// Version 1.0 did not persist RefreshAllowed. Preserve existing
+		// refresh sessions while applying the stricter rule to new tokens.
+		if token.Kind == "refresh" && !token.RefreshAllowed && containsScope(token.Scopes, "offline_access") {
+			token.RefreshAllowed = true
+		}
+		store.tokens[token.Hash] = token
+	}
+	for _, tombstone := range state.RefreshTombstones {
+		if tombstone.ExpiresAt > now {
+			store.refreshTombstones[tombstone.Hash] = tombstone
+		}
+	}
+	return store, nil
+}
+
+func applyStoreDefaults(workspaceID string, options *StoreOptions) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
@@ -117,31 +234,24 @@ func NewStore(workspaceID string, options StoreOptions) (*Store, error) {
 	if options.AuthCodeTTL <= 0 {
 		options.AuthCodeTTL = 5 * time.Minute
 	}
+	if options.MaxClients <= 0 {
+		options.MaxClients = defaultMaxClients
+	}
+	if options.MaxTokens <= 0 {
+		options.MaxTokens = defaultMaxTokens
+	}
+	if options.MaxAuthorizationCodes <= 0 {
+		options.MaxAuthorizationCodes = defaultMaxAuthorizationCodes
+	}
+	if options.MaxRefreshTombstones <= 0 {
+		options.MaxRefreshTombstones = defaultMaxRefreshTombstones
+	}
+	if options.MaxStateBytes <= 0 {
+		options.MaxStateBytes = defaultMaxStateBytes
+	}
 	if options.File == "" {
 		options.File = filepath.Join(config.StateDir(), "auth", workspaceID+".json")
 	}
-	store := &Store{
-		workspaceID: workspaceID, file: options.File, now: options.Now,
-		accessTokenTTL: options.AccessTokenTTL, refreshTokenTTL: options.RefreshTokenTTL, authCodeTTL: options.AuthCodeTTL,
-		clients: make(map[string]Client), tokens: make(map[string]TokenRecord), codes: make(map[string]authorizationCode),
-	}
-	var state persistedState
-	found, err := statefs.ReadJSONFile(options.File, &state)
-	if err != nil {
-		return nil, err
-	}
-	if found {
-		now := options.Now().UnixMilli()
-		for _, client := range state.Clients {
-			store.clients[client.ID] = client
-		}
-		for _, token := range state.Tokens {
-			if token.ExpiresAt > now {
-				store.tokens[token.Hash] = token
-			}
-		}
-	}
-	return store, nil
 }
 
 func hashValue(value string) string {
@@ -170,22 +280,50 @@ func safeEqual(left, right string) bool {
 	return subtle.ConstantTimeCompare(leftBytes, rightBytes) == 1
 }
 
+func (s *Store) pruneLocked() {
+	now := s.now()
+	nowMillis := now.UnixMilli()
+	for hash, token := range s.tokens {
+		if token.ExpiresAt <= nowMillis {
+			delete(s.tokens, hash)
+		}
+	}
+	for hash, tombstone := range s.refreshTombstones {
+		if tombstone.ExpiresAt <= nowMillis {
+			delete(s.refreshTombstones, hash)
+		}
+	}
+	for hash, code := range s.codes {
+		if !now.Before(code.ExpiresAt) {
+			delete(s.codes, hash)
+		}
+	}
+}
+
 func (s *Store) saveLocked() error {
-	now := s.now().UnixMilli()
+	s.pruneLocked()
 	state := persistedState{}
 	for _, client := range s.clients {
 		state.Clients = append(state.Clients, client)
 	}
-	for hash, token := range s.tokens {
-		if token.ExpiresAt > now {
-			state.Tokens = append(state.Tokens, token)
-		} else {
-			delete(s.tokens, hash)
-		}
+	for _, token := range s.tokens {
+		state.Tokens = append(state.Tokens, token)
+	}
+	for _, tombstone := range s.refreshTombstones {
+		state.RefreshTombstones = append(state.RefreshTombstones, tombstone)
 	}
 	sort.Slice(state.Clients, func(i, j int) bool { return state.Clients[i].ID < state.Clients[j].ID })
 	sort.Slice(state.Tokens, func(i, j int) bool { return state.Tokens[i].Hash < state.Tokens[j].Hash })
-	return statefs.WriteJSONFile(s.file, state)
+	sort.Slice(state.RefreshTombstones, func(i, j int) bool { return state.RefreshTombstones[i].Hash < state.RefreshTombstones[j].Hash })
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if int64(len(data)) > s.maxStateBytes {
+		return fmt.Errorf("%w: auth state exceeds %d bytes", ErrCapacity, s.maxStateBytes)
+	}
+	return statefs.WriteFileAtomic(s.file, data)
 }
 
 func (s *Store) RegisterClient(name string, redirects []string) (Client, error) {
@@ -202,41 +340,107 @@ func (s *Store) RegisterClientMetadata(metadata ClientMetadata) (Client, error) 
 		return Client{}, err
 	}
 	client := Client{
-		ID: id, Name: metadata.ClientName, RedirectURIs: metadata.RedirectURIs,
+		ID:                      id,
+		Name:                    metadata.ClientName,
+		RedirectURIs:            metadata.RedirectURIs,
 		TokenEndpointAuthMethod: metadata.TokenEndpointAuthMethod,
-		GrantTypes:              metadata.GrantTypes, ResponseTypes: metadata.ResponseTypes,
-		ApplicationType: metadata.ApplicationType,
-		CreatedAt:       s.now().UTC().Format(time.RFC3339Nano),
+		GrantTypes:              metadata.GrantTypes,
+		ResponseTypes:           metadata.ResponseTypes,
+		ApplicationType:         metadata.ApplicationType,
+		CreatedAt:               s.now().UTC().Format(time.RFC3339Nano),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked()
+	previous := cloneClients(s.clients)
+	s.makeClientRoomLocked()
+	if len(s.clients) >= s.maxClients {
+		return Client{}, fmt.Errorf("%w: OAuth client capacity reached", ErrCapacity)
+	}
 	s.clients[id] = client
 	if err := s.saveLocked(); err != nil {
-		delete(s.clients, id)
+		s.clients = previous
 		return Client{}, err
 	}
 	return client, nil
+}
+
+func cloneClients(source map[string]Client) map[string]Client {
+	clone := make(map[string]Client, len(source))
+	for id, client := range source {
+		clone[id] = cloneClient(client)
+	}
+	return clone
+}
+
+func (s *Store) makeClientRoomLocked() {
+	if len(s.clients) < s.maxClients {
+		return
+	}
+	active := make(map[string]struct{})
+	for _, token := range s.tokens {
+		active[token.ClientID] = struct{}{}
+	}
+	for _, code := range s.codes {
+		active[code.ClientID] = struct{}{}
+	}
+	candidates := make([]Client, 0, len(s.clients))
+	for _, client := range s.clients {
+		if _, ok := active[client.ID]; !ok {
+			candidates = append(candidates, client)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt == candidates[j].CreatedAt {
+			return candidates[i].ID < candidates[j].ID
+		}
+		return candidates[i].CreatedAt < candidates[j].CreatedAt
+	})
+	for _, client := range candidates {
+		if len(s.clients) < s.maxClients {
+			break
+		}
+		delete(s.clients, client.ID)
+	}
 }
 
 func (s *Store) Client(id string) (Client, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	client, ok := s.clients[id]
-	return client, ok
+	return cloneClient(client), ok
 }
 
-func (s *Store) CreateAuthorizationCode(clientID, redirectURI, challenge string, scopes []string, pairingID, audience string) (string, error) {
+func cloneClient(client Client) Client {
+	client.RedirectURIs = append([]string(nil), client.RedirectURIs...)
+	client.GrantTypes = append([]string(nil), client.GrantTypes...)
+	client.ResponseTypes = append([]string(nil), client.ResponseTypes...)
+	return client
+}
+
+func (s *Store) CreateAuthorizationCode(request AuthorizationCodeRequest) (string, error) {
 	code, err := randomToken("cl_ac", 32)
 	if err != nil {
 		return "", err
 	}
 	record := authorizationCode{
-		Hash: hashValue(code), ClientID: clientID, RedirectURI: redirectURI, CodeChallenge: challenge,
-		Scopes: append([]string(nil), scopes...), WorkspaceID: s.workspaceID, PairingID: pairingID,
-		Audience: audience, ExpiresAt: s.now().Add(s.authCodeTTL),
+		Hash:           hashValue(code),
+		ClientID:       request.ClientID,
+		RedirectURI:    request.RedirectURI,
+		CodeChallenge:  request.CodeChallenge,
+		Scopes:         append([]string(nil), request.Scopes...),
+		WorkspaceID:    s.workspaceID,
+		PairingID:      request.PairingID,
+		Audience:       request.Audience,
+		RefreshAllowed: request.RefreshAllowed,
+		ExpiresAt:      s.now().Add(s.authCodeTTL),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked()
+	if len(s.codes) >= s.maxAuthorizationCodes {
+		return "", fmt.Errorf("%w: authorization code capacity reached", ErrCapacity)
+	}
 	s.codes[record.Hash] = record
 	return code, nil
 }
@@ -245,24 +449,34 @@ func (s *Store) ExchangeAuthorizationCode(code, clientID, redirectURI, verifier,
 	hash := hashValue(code)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked()
 	record, ok := s.codes[hash]
 	delete(s.codes, hash)
-	if !ok || s.now().After(record.ExpiresAt) {
-		return TokenSet{}, errors.New("invalid_grant")
+	if !ok || !s.now().Before(record.ExpiresAt) {
+		return TokenSet{}, ErrInvalidGrant
 	}
-	if record.ClientID != clientID || (redirectURI != "" && record.RedirectURI != redirectURI) {
-		return TokenSet{}, errors.New("invalid_grant")
+	if redirectURI == "" || record.ClientID != clientID || record.RedirectURI != redirectURI {
+		return TokenSet{}, ErrInvalidGrant
 	}
 	if audience != "" && !sameResource(audience, record.Audience) {
-		return TokenSet{}, errors.New("invalid_target")
+		return TokenSet{}, ErrInvalidTarget
 	}
 	if !validVerifier(verifier) || !safeEqual(PKCEChallenge(verifier), record.CodeChallenge) {
-		return TokenSet{}, errors.New("invalid_grant")
+		return TokenSet{}, ErrInvalidGrant
 	}
-	return s.issueTokensLocked(clientID, record.Scopes, record.Audience, "")
+	return s.issueTokensLocked(clientID, record.Scopes, record.Audience, "", record.RefreshAllowed)
 }
 
-func (s *Store) issueTokensLocked(clientID string, scopes []string, audience, familyID string) (TokenSet, error) {
+func (s *Store) issueTokensLocked(clientID string, scopes []string, audience, familyID string, refreshAllowed bool) (TokenSet, error) {
+	s.pruneLocked()
+	issueRefresh := refreshAllowed && containsScope(scopes, "offline_access")
+	needed := 1
+	if issueRefresh {
+		needed++
+	}
+	if len(s.tokens)+needed > s.maxTokens {
+		return TokenSet{}, fmt.Errorf("%w: token capacity reached", ErrCapacity)
+	}
 	now := s.now()
 	access, err := randomToken("cl_at", 32)
 	if err != nil {
@@ -275,56 +489,110 @@ func (s *Store) issueTokensLocked(clientID string, scopes []string, audience, fa
 		}
 	}
 	accessRecord := TokenRecord{
-		Hash: hashValue(access), Kind: "access", ClientID: clientID, WorkspaceID: s.workspaceID,
-		Audience: audience, Scopes: append([]string(nil), scopes...), FamilyID: familyID,
-		IssuedAt: now.UnixMilli(), ExpiresAt: now.Add(s.accessTokenTTL).UnixMilli(),
+		Hash:           hashValue(access),
+		Kind:           "access",
+		ClientID:       clientID,
+		WorkspaceID:    s.workspaceID,
+		Audience:       audience,
+		Scopes:         append([]string(nil), scopes...),
+		FamilyID:       familyID,
+		RefreshAllowed: refreshAllowed,
+		IssuedAt:       now.UnixMilli(),
+		ExpiresAt:      now.Add(s.accessTokenTTL).UnixMilli(),
 	}
 	s.tokens[accessRecord.Hash] = accessRecord
 	refresh := ""
-	if containsScope(scopes, "offline_access") {
+	refreshHash := ""
+	if issueRefresh {
 		refresh, err = randomToken("cl_rt", 32)
 		if err != nil {
 			delete(s.tokens, accessRecord.Hash)
 			return TokenSet{}, err
 		}
-		refreshRecord := TokenRecord{
-			Hash: hashValue(refresh), Kind: "refresh", ClientID: clientID, WorkspaceID: s.workspaceID,
-			Audience: audience, Scopes: append([]string(nil), scopes...), FamilyID: familyID,
-			IssuedAt: now.UnixMilli(), ExpiresAt: now.Add(s.refreshTokenTTL).UnixMilli(),
+		refreshHash = hashValue(refresh)
+		s.tokens[refreshHash] = TokenRecord{
+			Hash:           refreshHash,
+			Kind:           "refresh",
+			ClientID:       clientID,
+			WorkspaceID:    s.workspaceID,
+			Audience:       audience,
+			Scopes:         append([]string(nil), scopes...),
+			FamilyID:       familyID,
+			RefreshAllowed: true,
+			IssuedAt:       now.UnixMilli(),
+			ExpiresAt:      now.Add(s.refreshTokenTTL).UnixMilli(),
 		}
-		s.tokens[refreshRecord.Hash] = refreshRecord
 	}
 	if err := s.saveLocked(); err != nil {
 		delete(s.tokens, accessRecord.Hash)
-		if refresh != "" {
-			delete(s.tokens, hashValue(refresh))
+		if refreshHash != "" {
+			delete(s.tokens, refreshHash)
 		}
 		return TokenSet{}, err
 	}
-	return TokenSet{AccessToken: access, RefreshToken: refresh, ExpiresIn: int(s.accessTokenTTL.Seconds()), Scopes: append([]string(nil), scopes...)}, nil
+	return TokenSet{
+		AccessToken:  access,
+		RefreshToken: refresh,
+		ExpiresIn:    int(s.accessTokenTTL.Seconds()),
+		Scopes:       append([]string(nil), scopes...),
+	}, nil
 }
 
 func (s *Store) Refresh(refreshToken, clientID, audience string) (TokenSet, error) {
 	hash := hashValue(refreshToken)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked()
 	record, ok := s.tokens[hash]
-	if !ok || record.Kind != "refresh" || record.ExpiresAt <= s.now().UnixMilli() {
-		return TokenSet{}, errors.New("invalid_grant")
+	if !ok {
+		if tombstone, replay := s.refreshTombstones[hash]; replay {
+			s.revokeFamilyLocked(tombstone.FamilyID)
+			if err := s.saveLocked(); err != nil {
+				return TokenSet{}, err
+			}
+		}
+		return TokenSet{}, ErrInvalidGrant
+	}
+	if record.Kind != "refresh" || !record.RefreshAllowed || record.ExpiresAt <= s.now().UnixMilli() {
+		return TokenSet{}, ErrInvalidGrant
 	}
 	if record.ClientID != clientID {
-		return TokenSet{}, errors.New("invalid_client")
+		return TokenSet{}, ErrInvalidClient
+	}
+	if client, registered := s.clients[clientID]; registered && !containsString(client.GrantTypes, "refresh_token") {
+		return TokenSet{}, ErrInvalidGrant
 	}
 	if audience != "" && !sameResource(audience, record.Audience) {
-		return TokenSet{}, errors.New("invalid_target")
+		return TokenSet{}, ErrInvalidTarget
+	}
+	if len(s.refreshTombstones) >= s.maxRefreshTombstones {
+		return TokenSet{}, fmt.Errorf("%w: refresh replay history capacity reached", ErrCapacity)
 	}
 	delete(s.tokens, hash)
-	set, err := s.issueTokensLocked(clientID, record.Scopes, record.Audience, record.FamilyID)
+	s.refreshTombstones[hash] = refreshTombstone{
+		Hash:      hash,
+		FamilyID:  record.FamilyID,
+		Audience:  record.Audience,
+		ExpiresAt: record.ExpiresAt,
+	}
+	set, err := s.issueTokensLocked(clientID, record.Scopes, record.Audience, record.FamilyID, true)
 	if err != nil {
+		delete(s.refreshTombstones, hash)
 		s.tokens[hash] = record
 		return TokenSet{}, err
 	}
 	return set, nil
+}
+
+func (s *Store) revokeFamilyLocked(familyID string) {
+	if familyID == "" {
+		return
+	}
+	for hash, token := range s.tokens {
+		if token.FamilyID == familyID {
+			delete(s.tokens, hash)
+		}
+	}
 }
 
 func (s *Store) VerifyAccess(token, audience string) (Principal, error) {
@@ -343,13 +611,29 @@ func (s *Store) VerifyAccess(token, audience string) (Principal, error) {
 	if audience != "" && !sameResource(audience, record.Audience) {
 		return Principal{}, errors.New("wrong_audience")
 	}
-	return Principal{Token: token, ClientID: record.ClientID, WorkspaceID: record.WorkspaceID, Audience: record.Audience, Scopes: append([]string(nil), record.Scopes...), ExpiresAt: time.UnixMilli(record.ExpiresAt)}, nil
+	return Principal{
+		Token:       token,
+		ClientID:    record.ClientID,
+		WorkspaceID: record.WorkspaceID,
+		Audience:    record.Audience,
+		Scopes:      append([]string(nil), record.Scopes...),
+		ExpiresAt:   time.UnixMilli(record.ExpiresAt),
+	}, nil
 }
 
 func (s *Store) Revoke(token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.tokens, hashValue(token))
+	hash := hashValue(token)
+	if record, ok := s.tokens[hash]; ok {
+		if record.FamilyID == "" {
+			delete(s.tokens, hash)
+		} else {
+			s.revokeFamilyLocked(record.FamilyID)
+		}
+	} else if tombstone, ok := s.refreshTombstones[hash]; ok {
+		s.revokeFamilyLocked(tombstone.FamilyID)
+	}
 	return s.saveLocked()
 }
 
@@ -359,6 +643,7 @@ func (s *Store) RevokeAll() (int, error) {
 	count := len(s.tokens)
 	s.tokens = make(map[string]TokenRecord)
 	s.codes = make(map[string]authorizationCode)
+	s.refreshTombstones = make(map[string]refreshTombstone)
 	return count, s.saveLocked()
 }
 
@@ -373,6 +658,12 @@ func (s *Store) TokenCount() int {
 		}
 	}
 	return count
+}
+
+func (s *Store) ClientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.clients)
 }
 
 // TokenCountForAudience returns active access and refresh records bound to one
@@ -401,29 +692,38 @@ func (s *Store) RevokeAudience(audience string) (int, error) {
 			count++
 		}
 	}
+	for hash, tombstone := range s.refreshTombstones {
+		if sameResource(tombstone.Audience, audience) {
+			delete(s.refreshTombstones, hash)
+		}
+	}
 	return count, s.saveLocked()
 }
 
-func FilterScopes(requested string) []string {
+func ParseScopes(requested string) ([]string, error) {
 	if strings.TrimSpace(requested) == "" {
-		return append([]string(nil), SupportedScopes...)
+		return append([]string(nil), DefaultScopes...), nil
 	}
-	allowed := make(map[string]bool, len(SupportedScopes))
+	allowed := make(map[string]struct{}, len(SupportedScopes))
 	for _, scope := range SupportedScopes {
-		allowed[scope] = true
+		allowed[scope] = struct{}{}
 	}
-	seen := map[string]bool{}
+	seen := make(map[string]struct{})
 	result := make([]string, 0)
 	for _, scope := range strings.Fields(strings.ReplaceAll(requested, "+", " ")) {
-		if allowed[scope] && !seen[scope] {
-			seen[scope] = true
-			result = append(result, scope)
+		if _, ok := allowed[scope]; !ok {
+			return nil, fmt.Errorf("%w: unsupported scope %q", ErrInvalidScope, scope)
 		}
+		if _, duplicate := seen[scope]; duplicate {
+			continue
+		}
+		seen[scope] = struct{}{}
+		result = append(result, scope)
 	}
 	if len(result) == 0 {
-		return append([]string(nil), SupportedScopes...)
+		return nil, fmt.Errorf("%w: no supported scope requested", ErrInvalidScope)
 	}
-	return result
+	return result, nil
 }
 
 func containsScope(scopes []string, target string) bool {

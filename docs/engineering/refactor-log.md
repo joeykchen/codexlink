@@ -29,3 +29,13 @@ The Unix and PowerShell entry points expose the same behavior and environment ov
 ## Result
 
 The normal user path no longer requires Go, Homebrew, ripgrep, a separate cloudflared installation, or hand-written package-manager commands. Platform-specific work is owned by release automation and the installer, not by the user.
+
+## Round 3 — bounded authorization state and process ownership
+
+OAuth validation, capacity limits, refresh-family replay handling, redirect binding, and client grant enforcement now live behind the authorization store and server policies. Runtime startup owns the child process until it becomes healthy; cancellation and timeout paths terminate it deterministically. Shutdown retains a local PID fallback only after the workspace health identity has been verified.
+
+## Round 4 — defensive installation boundary
+
+The bootstrap installers now treat a checksum-valid archive as untrusted input. They enforce a fixed file allowlist, reject nested paths, links, duplicates and oversized entries, and replace the CodexLink/cloudflared pair as one same-directory transaction. Both Unix and Windows restore the previous pair on failure; Windows stops only processes running from the exact managed paths.
+
+The same hardening pass bounded tunnel output, made tunnel generations transactional, prevented loopback admin clients from following redirects or proxies, restarted stale-version bridges during upgrades, and made logging resistant to credential and carriage-return injection.

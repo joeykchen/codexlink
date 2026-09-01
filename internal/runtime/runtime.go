@@ -22,6 +22,13 @@ import (
 	"github.com/joeykchen/codexlink/internal/state"
 )
 
+var loopbackHTTPClient = &http.Client{
+	Transport: &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 type State struct {
 	Service       string `json:"service"`
 	Version       string `json:"version"`
@@ -39,6 +46,7 @@ type Health struct {
 	Service      string `json:"service"`
 	Version      string `json:"version"`
 	WorkspaceRef string `json:"workspaceRef"`
+	PID          int    `json:"pid,omitempty"`
 	Status       string `json:"status"`
 }
 
@@ -62,13 +70,16 @@ func Clear(workspaceID string) error {
 }
 
 func Probe(ctx context.Context, port int) (*Health, error) {
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid bridge port %d", port)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/health", nil)
 	if err != nil {
 		return nil, err
 	}
-	response, err := http.DefaultClient.Do(request)
+	response, err := loopbackHTTPClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +129,7 @@ func AdminRequest(ctx context.Context, state State, method, route string, body a
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := http.DefaultClient.Do(request)
+	response, err := loopbackHTTPClient.Do(request)
 	if err != nil {
 		return err
 	}

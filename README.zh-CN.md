@@ -22,14 +22,15 @@ irm https://raw.githubusercontent.com/joeykchen/codexlink/main/install.ps1 | iex
 识别系统与 CPU
 → 下载对应的预编译包
 → 校验 SHA-256
-→ 原子安装 CodexLink
-→ 安装随包提供的 cloudflared
+→ 以可回滚事务安装 CodexLink 与 cloudflared
 → 自动写入用户 PATH
 → 缺少 Git 时调用系统安装器自动配置
 → 直接启动当前工作区的一键引导
 ```
 
-普通用户不需要手工安装 Go、Homebrew、cloudflared、ripgrep，或执行平台包管理器命令。Go 只用于源码开发；全文搜索有纯 Go 回退实现；cloudflared 随每个平台的 CodexLink 发布包一起交付。
+普通用户不需要手工安装 Go、Homebrew、cloudflared 或 ripgrep。Go 只用于源码开发；全文搜索有纯 Go 回退实现；cloudflared 随 CodexLink 发布包一起交付。
+
+引导脚本会使用操作系统通常自带的基础能力：Shell、HTTPS 下载、归档解压和 SHA-256 校验。仅当系统缺少 Git 时，可能出现管理员密码或系统安装确认。正式发布支持 macOS Intel/Apple 芯片、Linux AMD64/ARM64 和 Windows AMD64。
 
 安装完成后，任何项目都只需要：
 

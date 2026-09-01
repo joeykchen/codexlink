@@ -182,10 +182,22 @@ func Start(options Options) (*Server, error) {
 		if count > 0 {
 			return setupui.Status{State: setupui.StateConnected, Authorized: true, TokenCount: count}
 		}
-		if !pairing.Active() {
-			return setupui.Status{State: setupui.StateFinishing}
+		pairingStatus := pairing.Status()
+		switch pairingStatus.State {
+		case auth.PairingStateActive:
+			return setupui.Status{State: setupui.StateWaiting}
+		case auth.PairingStateConsumed:
+			if time.Since(pairingStatus.ChangedAt) <= time.Minute {
+				return setupui.Status{State: setupui.StateFinishing}
+			}
+			return setupui.Status{State: setupui.StateFailed, Message: "ChatGPT did not finish the token exchange. Run codexlink again."}
+		case auth.PairingStateExpired:
+			return setupui.Status{State: setupui.StateFailed, Message: "The pairing code expired. Run codexlink again."}
+		case auth.PairingStateLocked:
+			return setupui.Status{State: setupui.StateFailed, Message: "The pairing code was locked after too many attempts. Run codexlink again."}
+		default:
+			return setupui.Status{State: setupui.StateFailed, Message: "No active pairing session exists. Run codexlink again."}
 		}
-		return setupui.Status{State: setupui.StateWaiting}
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.health)
@@ -254,7 +266,7 @@ func (s *Server) health(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(response, http.StatusOK, stateruntime.Health{Service: buildinfo.ServiceName, Version: buildinfo.Version, WorkspaceRef: s.PublicRef, Status: "ok"})
+	writeJSON(response, http.StatusOK, stateruntime.Health{Service: buildinfo.ServiceName, Version: buildinfo.Version, WorkspaceRef: s.PublicRef, PID: os.Getpid(), Status: "ok"})
 }
 
 func (s *Server) persistRuntime() error {

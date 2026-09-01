@@ -22,7 +22,9 @@ func TestTargetNaming(t *testing.T) {
 			t.Fatalf("cloudflared: got %q want %q", got, test.cloudflared)
 		}
 	}
-	if _, err := ParseTarget("plan9", "amd64"); err == nil {
-		t.Fatal("unsupported target was accepted")
+	for _, unsupported := range []Target{{OS: "plan9", Arch: "amd64"}, {OS: "windows", Arch: "arm64"}} {
+		if _, err := ParseTarget(unsupported.OS, unsupported.Arch); err == nil {
+			t.Fatalf("unsupported target %s was accepted", unsupported)
+		}
 	}
 }

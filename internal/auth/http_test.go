@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joeykchen/codexlink/internal/logging"
 )
@@ -288,5 +289,143 @@ func TestOAuthTokenJSONRejectsTrailingValues(t *testing.T) {
 	}
 	if body["error"] != "invalid_request" {
 		t.Fatalf("response = %#v", body)
+	}
+}
+
+func TestOAuthRejectsUnknownScopeAndRefreshScopeWithoutGrant(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := store.RegisterClientMetadata(ClientMetadata{
+		ClientName: "code-only", RedirectURIs: []string{"https://client.example/callback"},
+		GrantTypes: []string{"authorization_code"}, ResponseTypes: []string{"code"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	var server *httptest.Server
+	NewOAuthServer(store, NewPairingManager("ws", PairingOptions{}), "demo", func(*http.Request) string { return server.URL }, logging.Null()).Register(mux)
+	server = httptest.NewServer(mux)
+	defer server.Close()
+	httpClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	for _, scope := range []string{"unknown", "workspace.read offline_access"} {
+		query := url.Values{
+			"response_type": {"code"}, "client_id": {client.ID}, "redirect_uri": {client.RedirectURIs[0]},
+			"scope": {scope}, "code_challenge": {PKCEChallenge(strings.Repeat("s", 64))},
+			"code_challenge_method": {"S256"}, "resource": {server.URL + "/mcp"},
+		}
+		response, err := httpClient.Get(server.URL + "/oauth/authorize?" + query.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		location, _ := url.Parse(response.Header.Get("Location"))
+		response.Body.Close()
+		if response.StatusCode != http.StatusFound || location.Query().Get("error") != "invalid_scope" {
+			t.Fatalf("scope %q response = %d %s", scope, response.StatusCode, location)
+		}
+	}
+}
+
+func TestOAuthRegistrationAndPendingAuthorizationAreBounded(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := OAuthLimits{
+		MaxPending: 1, RegistrationPerIP: 1, RegistrationGlobal: 10,
+		AuthorizationPerIP: 10, AuthorizationGlobal: 10, MaxTrackedAddresses: 4, Window: time.Minute,
+	}
+	mux := http.NewServeMux()
+	var server *httptest.Server
+	NewOAuthServer(store, NewPairingManager("ws", PairingOptions{}), "demo", func(*http.Request) string { return server.URL }, logging.Null(), WithOAuthLimits(limits)).Register(mux)
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	registration := `{"client_name":"test","redirect_uris":["https://client.example/callback"]}`
+	first, err := http.Post(server.URL+"/oauth/register", "application/json", strings.NewReader(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registered struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&registered); err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	second, err := http.Post(server.URL+"/oauth/register", "application/json", strings.NewReader(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Body.Close()
+	if second.StatusCode != http.StatusTooManyRequests || second.Header.Get("Retry-After") == "" {
+		t.Fatalf("registration limit response = %d", second.StatusCode)
+	}
+
+	query := url.Values{
+		"response_type": {"code"}, "client_id": {registered.ClientID}, "redirect_uri": {"https://client.example/callback"},
+		"scope": {"workspace.read"}, "code_challenge": {PKCEChallenge(strings.Repeat("p", 64))},
+		"code_challenge_method": {"S256"}, "resource": {server.URL + "/mcp"},
+	}
+	response, err := http.Get(server.URL + "/oauth/authorize?" + query.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("first pending authorization = %d", response.StatusCode)
+	}
+	httpClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err = httpClient.Get(server.URL + "/oauth/authorize?" + query.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	location, _ := url.Parse(response.Header.Get("Location"))
+	response.Body.Close()
+	if response.StatusCode != http.StatusFound || location.Query().Get("error") != "temporarily_unavailable" {
+		t.Fatalf("pending limit response = %d %s", response.StatusCode, location)
+	}
+}
+
+func TestOAuthTokenRequiresRedirectURI(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := store.RegisterClient("client", []string{"https://client.example/callback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := strings.Repeat("r", 64)
+	code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read"}, Audience: "https://bridge.example/mcp", RefreshAllowed: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	var server *httptest.Server
+	NewOAuthServer(store, NewPairingManager("ws", PairingOptions{}), "demo", func(*http.Request) string { return server.URL }, logging.Null()).Register(mux)
+	server = httptest.NewServer(mux)
+	defer server.Close()
+	form := url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {verifier},
+		"client_id": {client.ID}, "resource": {"https://bridge.example/mcp"},
+	}
+	response, err := http.Post(server.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("token response = %d %#v", response.StatusCode, body)
 	}
 }

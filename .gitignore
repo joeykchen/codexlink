@@ -7,3 +7,6 @@
 /.refactor/
 *.tmp
 .DS_Store
+/.review/
+
+/.repair/

@@ -2,11 +2,18 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joeykchen/codexlink/internal/config"
@@ -76,5 +83,35 @@ func TestInstallSecretRepairsCorruptState(t *testing.T) {
 	decoded, err := base64.RawURLEncoding.DecodeString(string(bytes.TrimSpace(data)))
 	if err != nil || !bytes.Equal(secret, decoded) {
 		t.Fatalf("repaired secret mismatch: %v", err)
+	}
+}
+
+func TestProbeRejectsInvalidPortsAndRedirects(t *testing.T) {
+	if _, err := Probe(context.Background(), 0); err == nil {
+		t.Fatal("zero port was accepted")
+	}
+	var followed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/target" {
+			followed.Store(true)
+			response.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(response, request, "/target", http.StatusFound)
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Probe(context.Background(), port); err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("redirect probe error = %v", err)
+	}
+	if followed.Load() {
+		t.Fatal("loopback probe followed a redirect")
 	}
 }

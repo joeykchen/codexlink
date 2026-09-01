@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -29,14 +30,15 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 type BaseURLFunc func(*http.Request) string
 
 type PendingAuthorization struct {
-	ID            string
-	ClientID      string
-	RedirectURI   string
-	Scopes        []string
-	State         string
-	CodeChallenge string
-	Audience      string
-	ExpiresAt     time.Time
+	ID             string
+	ClientID       string
+	RedirectURI    string
+	Scopes         []string
+	State          string
+	CodeChallenge  string
+	Audience       string
+	RefreshAllowed bool
+	ExpiresAt      time.Time
 }
 
 type OAuthServer struct {
@@ -49,6 +51,9 @@ type OAuthServer struct {
 	mu               sync.Mutex
 	pending          map[string]PendingAuthorization
 	now              func() time.Time
+	limits           OAuthLimits
+	registerLimiter  *requestLimiter
+	authorizeLimiter *requestLimiter
 }
 
 type OAuthServerOption func(*OAuthServer)
@@ -61,14 +66,25 @@ func WithClientMetadataResolver(resolver ClientMetadataResolver) OAuthServerOpti
 	}
 }
 
+func WithOAuthLimits(limits OAuthLimits) OAuthServerOption {
+	return func(server *OAuthServer) { server.limits = normalizeOAuthLimits(limits) }
+}
+
 func NewOAuthServer(store *Store, pairing *PairingManager, workspaceName string, baseURL BaseURLFunc, logger *logging.Logger, options ...OAuthServerOption) *OAuthServer {
+	if logger == nil {
+		logger = logging.Null()
+	}
 	server := &OAuthServer{
 		store: store, pairing: pairing, workspaceName: workspaceName, baseURL: baseURL, logger: logger,
 		metadataResolver: NewHTTPClientMetadataResolver(), pending: make(map[string]PendingAuthorization), now: time.Now,
+		limits: defaultOAuthLimits(),
 	}
 	for _, option := range options {
 		option(server)
 	}
+	server.limits = normalizeOAuthLimits(server.limits)
+	server.registerLimiter = newRequestLimiter(server.limits.RegistrationPerIP, server.limits.RegistrationGlobal, server.limits.Window, server.limits.MaxTrackedAddresses)
+	server.authorizeLimiter = newRequestLimiter(server.limits.AuthorizationPerIP, server.limits.AuthorizationGlobal, server.limits.Window, server.limits.MaxTrackedAddresses)
 	return server
 }
 
@@ -140,6 +156,11 @@ func (s *OAuthServer) registerClient(response http.ResponseWriter, request *http
 		methodNotAllowed(response, http.MethodPost)
 		return
 	}
+	if !s.registerLimiter.Allow(ClientIP(request), s.now()) {
+		response.Header().Set("Retry-After", fmt.Sprintf("%d", int(s.limits.Window.Seconds())))
+		oauthError(response, http.StatusTooManyRequests, "temporarily_unavailable", "client registration rate limit exceeded")
+		return
+	}
 	request.Body = http.MaxBytesReader(response, request.Body, 256*1024)
 	defer request.Body.Close()
 	var metadata ClientMetadata
@@ -154,6 +175,10 @@ func (s *OAuthServer) registerClient(response http.ResponseWriter, request *http
 	}
 	client, err := s.store.RegisterClientMetadata(metadata)
 	if err != nil {
+		if errors.Is(err, ErrCapacity) {
+			oauthError(response, http.StatusServiceUnavailable, "temporarily_unavailable", "client registration capacity reached")
+			return
+		}
 		code := "invalid_client_metadata"
 		if strings.Contains(err.Error(), "redirect URI") {
 			code = "invalid_redirect_uri"
@@ -199,13 +224,19 @@ func (s *OAuthServer) authorize(response http.ResponseWriter, request *http.Requ
 func (s *OAuthServer) prunePendingLocked() {
 	now := s.now()
 	for id, pending := range s.pending {
-		if now.After(pending.ExpiresAt) {
+		if !now.Before(pending.ExpiresAt) {
 			delete(s.pending, id)
 		}
 	}
 }
 
 func (s *OAuthServer) authorizeStart(response http.ResponseWriter, request *http.Request) {
+	if !s.authorizeLimiter.Allow(ClientIP(request), s.now()) {
+		response.Header().Set("Retry-After", fmt.Sprintf("%d", int(s.limits.Window.Seconds())))
+		secureHTMLHeaders(response)
+		http.Error(response, "Authorization rate limit exceeded. Try again shortly.", http.StatusTooManyRequests)
+		return
+	}
 	query := request.URL.Query()
 	clientID := query.Get("client_id")
 	client, err := s.resolveClient(request.Context(), clientID)
@@ -252,17 +283,33 @@ func (s *OAuthServer) authorizeStart(response http.ResponseWriter, request *http
 	} else {
 		audience = expectedAudience
 	}
+	scopes, err := ParseScopes(query.Get("scope"))
+	if err != nil {
+		fail("invalid_scope", err.Error())
+		return
+	}
+	refreshAllowed := containsString(client.GrantTypes, "refresh_token")
+	if containsScope(scopes, "offline_access") && !refreshAllowed {
+		fail("invalid_scope", "offline_access requires the refresh_token grant")
+		return
+	}
 	id, err := secureID(24)
 	if err != nil {
 		http.Error(response, "authorization service unavailable", http.StatusInternalServerError)
 		return
 	}
 	pending := PendingAuthorization{
-		ID: id, ClientID: client.ID, RedirectURI: redirect, Scopes: FilterScopes(query.Get("scope")),
-		State: query.Get("state"), CodeChallenge: challenge, Audience: audience, ExpiresAt: s.now().Add(10 * time.Minute),
+		ID: id, ClientID: client.ID, RedirectURI: redirect, Scopes: scopes,
+		State: query.Get("state"), CodeChallenge: challenge, Audience: audience,
+		RefreshAllowed: refreshAllowed, ExpiresAt: s.now().Add(10 * time.Minute),
 	}
 	s.mu.Lock()
 	s.prunePendingLocked()
+	if len(s.pending) >= s.limits.MaxPending {
+		s.mu.Unlock()
+		fail("temporarily_unavailable", "too many authorization requests are pending")
+		return
+	}
 	s.pending[id] = pending
 	s.mu.Unlock()
 	secureHTMLHeaders(response)
@@ -303,7 +350,10 @@ func (s *OAuthServer) authorizeComplete(response http.ResponseWriter, request *h
 	s.mu.Lock()
 	delete(s.pending, requestID)
 	s.mu.Unlock()
-	code, err := s.store.CreateAuthorizationCode(pending.ClientID, pending.RedirectURI, pending.CodeChallenge, pending.Scopes, verdict.SessionID, pending.Audience)
+	code, err := s.store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: pending.ClientID, RedirectURI: pending.RedirectURI, CodeChallenge: pending.CodeChallenge,
+		Scopes: pending.Scopes, PairingID: verdict.SessionID, Audience: pending.Audience, RefreshAllowed: pending.RefreshAllowed,
+	})
 	if err != nil {
 		http.Error(response, "authorization service unavailable", http.StatusInternalServerError)
 		return
@@ -334,13 +384,14 @@ func (s *OAuthServer) token(response http.ResponseWriter, request *http.Request)
 	switch grantType {
 	case "authorization_code":
 		code, verifier, clientID := parameters.Get("code"), parameters.Get("code_verifier"), parameters.Get("client_id")
-		if code == "" || verifier == "" || clientID == "" {
-			oauthError(response, http.StatusBadRequest, "invalid_request", "code, code_verifier, and client_id are required")
+		redirectURI := parameters.Get("redirect_uri")
+		if code == "" || verifier == "" || clientID == "" || redirectURI == "" {
+			oauthError(response, http.StatusBadRequest, "invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
 			return
 		}
-		set, exchangeErr := s.store.ExchangeAuthorizationCode(code, clientID, parameters.Get("redirect_uri"), verifier, parameters.Get("resource"))
+		set, exchangeErr := s.store.ExchangeAuthorizationCode(code, clientID, redirectURI, verifier, parameters.Get("resource"))
 		if exchangeErr != nil {
-			oauthError(response, http.StatusBadRequest, exchangeErr.Error(), "authorization code exchange failed")
+			oauthError(response, oauthStatus(exchangeErr), oauthCode(exchangeErr), "authorization code exchange failed")
 			return
 		}
 		writeTokenSet(response, set)
@@ -352,7 +403,7 @@ func (s *OAuthServer) token(response http.ResponseWriter, request *http.Request)
 		}
 		set, refreshErr := s.store.Refresh(refresh, clientID, parameters.Get("resource"))
 		if refreshErr != nil {
-			oauthError(response, http.StatusBadRequest, refreshErr.Error(), "refresh token exchange failed")
+			oauthError(response, oauthStatus(refreshErr), oauthCode(refreshErr), "refresh token exchange failed")
 			return
 		}
 		writeTokenSet(response, set)
@@ -471,6 +522,28 @@ func containsExact(values []string, target string) bool {
 func methodNotAllowed(response http.ResponseWriter, allowed ...string) {
 	response.Header().Set("Allow", strings.Join(allowed, ", "))
 	writeJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+}
+
+func oauthCode(err error) string {
+	switch {
+	case errors.Is(err, ErrInvalidGrant):
+		return "invalid_grant"
+	case errors.Is(err, ErrInvalidClient):
+		return "invalid_client"
+	case errors.Is(err, ErrInvalidTarget):
+		return "invalid_target"
+	case errors.Is(err, ErrCapacity):
+		return "temporarily_unavailable"
+	default:
+		return "server_error"
+	}
+}
+
+func oauthStatus(err error) int {
+	if errors.Is(err, ErrCapacity) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadRequest
 }
 
 func oauthError(response http.ResponseWriter, status int, code, description string) {

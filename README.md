@@ -16,7 +16,9 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/joeykchen/codexlink/main/install.ps1 | iex
 ```
 
-The installer detects the operating system and CPU, downloads a checksum-verified self-contained package, installs CodexLink and `cloudflared`, updates the user PATH, provisions Git when it is absent, and starts onboarding. End users do **not** install Go, Homebrew, ripgrep, cloudflared, or package-manager dependencies themselves.
+The installer detects the operating system and CPU, downloads a checksum-verified self-contained package, safely extracts it, installs CodexLink and `cloudflared` as one recoverable transaction, updates the user PATH, provisions Git when it is absent, and starts onboarding. End users do **not** install Go, Homebrew, ripgrep, or cloudflared themselves.
+
+The bootstrap uses basic facilities normally supplied by the operating system: a shell, an HTTPS downloader, archive extraction, and SHA-256 verification. A system permission prompt can appear when Git must be installed. Supported release targets are macOS Intel/Apple silicon, Linux AMD64/ARM64, and Windows AMD64.
 
 After installation, any workspace starts with:
 

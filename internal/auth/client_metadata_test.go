@@ -1,8 +1,12 @@
 package auth
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedirectURIMatchesLoopbackEphemeralPort(t *testing.T) {
@@ -87,5 +91,86 @@ func TestClientMetadataRejectsNoSupportedAuthIntersection(t *testing.T) {
 	}).normalized()
 	if err == nil {
 		t.Fatal("metadata without none support should be rejected")
+	}
+}
+
+func TestClientMetadataCacheIsBoundedAndLRU(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	resolver := NewHTTPClientMetadataResolver()
+	resolver.MaxCacheEntries = 2
+	resolver.cache = map[string]metadataCacheEntry{
+		"old": {client: Client{ID: "old"}, expiresAt: now.Add(time.Minute), lastUsed: now},
+		"new": {client: Client{ID: "new"}, expiresAt: now.Add(time.Minute), lastUsed: now.Add(time.Second)},
+	}
+	resolver.evictOldestLocked()
+	if _, ok := resolver.cache["old"]; ok {
+		t.Fatal("least recently used entry was not evicted")
+	}
+	resolver.cache["expired"] = metadataCacheEntry{client: Client{ID: "expired"}, expiresAt: now, lastUsed: now}
+	resolver.pruneCacheLocked(now)
+	if _, ok := resolver.cache["expired"]; ok {
+		t.Fatal("expired cache entry was not pruned")
+	}
+}
+
+func TestClientMetadataBounds(t *testing.T) {
+	valid := ClientMetadata{RedirectURIs: []string{"https://example.com/callback"}}
+	cases := []struct {
+		name     string
+		metadata ClientMetadata
+	}{
+		{"too many redirects", func() ClientMetadata {
+			value := valid
+			value.RedirectURIs = make([]string, maxClientMetadataRedirectURIs+1)
+			for i := range value.RedirectURIs {
+				value.RedirectURIs[i] = fmt.Sprintf("https://example.com/callback/%d", i)
+			}
+			return value
+		}()},
+		{"long redirect", ClientMetadata{RedirectURIs: []string{"https://example.com/" + strings.Repeat("x", maxClientMetadataURIBytes)}}},
+		{"long client id", ClientMetadata{ClientID: "https://example.com/" + strings.Repeat("x", maxClientMetadataURIBytes), RedirectURIs: valid.RedirectURIs}},
+		{"too many grants", ClientMetadata{RedirectURIs: valid.RedirectURIs, GrantTypes: make([]string, maxClientMetadataValues+1)}},
+		{"long scope", ClientMetadata{RedirectURIs: valid.RedirectURIs, Scope: strings.Repeat("x", maxClientMetadataScopeBytes+1)}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.metadata.normalized(); err == nil {
+				t.Fatal("oversized metadata was accepted")
+			}
+		})
+	}
+	if _, err := valid.normalized(); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+}
+
+func TestMetadataClientIDLengthIsBounded(t *testing.T) {
+	value := "https://example.com/" + strings.Repeat("x", maxClientMetadataURIBytes)
+	if _, err := parseMetadataClientID(value); err == nil {
+		t.Fatal("oversized metadata client_id was accepted")
+	}
+}
+
+func TestClientMetadataCacheReturnsDefensiveCopies(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	clientID := "https://example.com/client.json"
+	resolver := NewHTTPClientMetadataResolver()
+	resolver.Now = func() time.Time { return now }
+	resolver.cache[clientID] = metadataCacheEntry{
+		client:    Client{ID: clientID, RedirectURIs: []string{"https://example.com/callback"}, GrantTypes: []string{"authorization_code"}},
+		expiresAt: now.Add(time.Minute), lastUsed: now,
+	}
+	first, err := resolver.Resolve(context.Background(), clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.RedirectURIs[0] = "https://attacker.example/callback"
+	first.GrantTypes[0] = "refresh_token"
+	second, err := resolver.Resolve(context.Background(), clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RedirectURIs[0] != "https://example.com/callback" || second.GrantTypes[0] != "authorization_code" {
+		t.Fatalf("cached client was mutated through a returned value: %+v", second)
 	}
 }

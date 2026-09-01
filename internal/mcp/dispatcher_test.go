@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/joeykchen/codexlink/internal/auth"
+	"github.com/joeykchen/codexlink/internal/buildinfo"
 	"github.com/joeykchen/codexlink/internal/logging"
 	"github.com/joeykchen/codexlink/internal/workspace"
 )
@@ -183,7 +184,7 @@ func TestDispatcherModernDiscoveryAndRemovedMethods(t *testing.T) {
 		t.Fatalf("missing server metadata: %#v", payload["_meta"])
 	}
 	serverInfo, ok := metadata[serverInfoMetaKey].(map[string]any)
-	if !ok || serverInfo["name"] != "codexlink-bridge" || serverInfo["version"] != "1.0.0" {
+	if !ok || serverInfo["name"] != "codexlink-bridge" || serverInfo["version"] != buildinfo.Version {
 		t.Fatalf("server info: %#v", metadata)
 	}
 
