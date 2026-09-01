@@ -29,8 +29,22 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+func loopbackTestClient(t *testing.T) *http.Client {
+	t.Helper()
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             nil,
+			DisableKeepAlives: true,
+		},
+		Timeout: 5 * time.Second,
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	return client
+}
+
 func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	t.Setenv("CODEXLINK_STATE_DIR", t.TempDir())
+	httpClient := loopbackTestClient(t)
 	root := t.TempDir()
 	server, err := Start(Options{WorkspaceRoot: root, Port: freePort(t)})
 	if err != nil {
@@ -38,7 +52,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	}
 	defer server.Close()
 
-	response, err := http.Get(server.LocalBaseURL() + "/health")
+	response, err := httpClient.Get(server.LocalBaseURL() + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +70,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	}
 
 	request, _ := http.NewRequest(http.MethodGet, server.LocalBaseURL()+"/admin/info", nil)
-	response, err = http.DefaultClient.Do(request)
+	response, err = httpClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +80,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	response.Body.Close()
 	request, _ = http.NewRequest(http.MethodPost, server.LocalBaseURL()+"/admin/pairing", nil)
 	request.Header.Set("Authorization", "Bearer "+server.AdminToken)
-	response, err = http.DefaultClient.Do(request)
+	response, err = httpClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +116,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("MCP-Protocol-Version", "2026-07-28")
 	request.Header.Set("Mcp-Method", "server/discover")
-	response, err = http.DefaultClient.Do(request)
+	response, err = httpClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +140,7 @@ func TestServerHealthAdminAuthAndMCPWiring(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	request, _ = http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(server.Port)+"/health", nil)
-	if _, err := http.DefaultClient.Do(request); err == nil {
+	if _, err := httpClient.Do(request); err == nil {
 		t.Fatal("closed server still accepted requests")
 	}
 }
@@ -140,6 +154,7 @@ func TestServerRejectsPublicBind(t *testing.T) {
 
 func TestSetupSessionCreatesLocalPage(t *testing.T) {
 	t.Setenv("CODEXLINK_STATE_DIR", t.TempDir())
+	httpClient := loopbackTestClient(t)
 	server, err := Start(Options{WorkspaceRoot: t.TempDir(), Port: freePort(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +170,7 @@ func TestSetupSessionCreatesLocalPage(t *testing.T) {
 	request, _ := http.NewRequest(http.MethodPost, server.LocalBaseURL()+"/admin/setup-session", bytes.NewReader(encoded))
 	request.Header.Set("Authorization", "Bearer "+server.AdminToken)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
+	response, err := httpClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +186,7 @@ func TestSetupSessionCreatesLocalPage(t *testing.T) {
 		t.Fatalf("setup response = %d %+v", response.StatusCode, setup)
 	}
 
-	page, err := http.Get(setup.URL)
+	page, err := httpClient.Get(setup.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +198,7 @@ func TestSetupSessionCreatesLocalPage(t *testing.T) {
 
 	proxied, _ := http.NewRequest(http.MethodGet, setup.URL, nil)
 	proxied.Header.Set("X-Forwarded-For", "127.0.0.1")
-	proxiedResponse, err := http.DefaultClient.Do(proxied)
+	proxiedResponse, err := httpClient.Do(proxied)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +210,7 @@ func TestSetupSessionCreatesLocalPage(t *testing.T) {
 
 func TestMCPOriginGuard(t *testing.T) {
 	t.Setenv("CODEXLINK_STATE_DIR", t.TempDir())
+	httpClient := loopbackTestClient(t)
 	server, err := Start(Options{WorkspaceRoot: t.TempDir(), Port: freePort(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +228,7 @@ func TestMCPOriginGuard(t *testing.T) {
 		request, _ := http.NewRequest(http.MethodPost, server.LocalBaseURL()+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Origin", test.origin)
-		response, err := http.DefaultClient.Do(request)
+		response, err := httpClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -237,6 +253,7 @@ func TestNormalizeOrigin(t *testing.T) {
 
 func TestSetupStatusTracksOnlyTheCurrentMCPAudience(t *testing.T) {
 	t.Setenv("CODEXLINK_STATE_DIR", t.TempDir())
+	httpClient := loopbackTestClient(t)
 	server, err := Start(Options{WorkspaceRoot: t.TempDir(), Port: freePort(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +268,7 @@ func TestSetupStatusTracksOnlyTheCurrentMCPAudience(t *testing.T) {
 	request, _ := http.NewRequest(http.MethodPost, server.LocalBaseURL()+"/admin/setup-session", bytes.NewReader(payload))
 	request.Header.Set("Authorization", "Bearer "+server.AdminToken)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
+	response, err := httpClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +282,7 @@ func TestSetupStatusTracksOnlyTheCurrentMCPAudience(t *testing.T) {
 
 	readStatus := func() setupui.Status {
 		t.Helper()
-		statusResponse, err := http.Get(setup.URL + "/status")
+		statusResponse, err := httpClient.Get(setup.URL + "/status")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -305,7 +322,7 @@ func TestSetupStatusTracksOnlyTheCurrentMCPAudience(t *testing.T) {
 
 	infoRequest, _ := http.NewRequest(http.MethodGet, server.LocalBaseURL()+"/admin/info", nil)
 	infoRequest.Header.Set("Authorization", "Bearer "+server.AdminToken)
-	infoResponse, err := http.DefaultClient.Do(infoRequest)
+	infoResponse, err := httpClient.Do(infoRequest)
 	if err != nil {
 		t.Fatal(err)
 	}

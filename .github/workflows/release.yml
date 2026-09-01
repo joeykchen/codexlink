@@ -3,15 +3,6 @@ name: release
 on:
   workflow_dispatch:
   push:
-    branches: [main]
-    paths:
-      - VERSION
-      - deps.lock.json
-      - cmd/releasepack/**
-      - internal/distribution/**
-      - install.sh
-      - install.ps1
-      - .github/workflows/release.yml
     tags:
       - 'v*'
 
@@ -19,7 +10,61 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify tagged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || { echo "release must run from a tag" >&2; exit 1; }
+          [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo "tag $GITHUB_REF_NAME does not match VERSION $version" >&2; exit 1; }
+          git diff --exit-code
+      - name: Run release quality gate
+        run: make full-check
+
+  verify-unix-installer:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sh -n install.sh scripts/*.sh
+      - run: ./scripts/test-install.sh
+
+  verify-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($path in @('install.ps1', 'scripts/install.ps1', 'scripts/test-install.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${path}: $_" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+      - shell: pwsh
+        run: ./scripts/test-install.ps1
+
   package:
+    needs: [verify, verify-unix-installer, verify-windows-installer]
     strategy:
       fail-fast: false
       matrix:
@@ -39,17 +84,13 @@ jobs:
           - goos: windows
             goarch: amd64
             cloudflared: cloudflared-windows-amd64.exe
-          - goos: windows
-            goarch: arm64
-            cloudflared: cloudflared-windows-arm64.exe
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Read locked versions
         id: versions
@@ -57,7 +98,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "codexlink=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-          echo "cloudflared=$(jq -r '.cloudflared.version' deps.lock.json)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open('deps.lock.json', encoding='utf-8') as handle:
+              lock = json.load(handle)['cloudflared']
+          print(f"cloudflared_repository={lock['repository']}")
+          print(f"cloudflared_version={lock['version']}")
+          PY
 
       - name: Build CodexLink
         shell: bash
@@ -70,36 +117,41 @@ jobs:
           set -euo pipefail
           mkdir -p stage dist
           suffix=""
-          if [[ "$GOOS" == windows ]]; then suffix=".exe"; fi
-          go build -trimpath -ldflags "-s -w -X github.com/joeykchen/codexlink/internal/buildinfo.Version=$VERSION" -o "stage/codexlink${suffix}" ./cmd/codexlink
+          [[ "$GOOS" == windows ]] && suffix=".exe"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/joeykchen/codexlink/internal/buildinfo.Version=$VERSION" \
+            -o "stage/codexlink${suffix}" ./cmd/codexlink
 
-      - name: Download and verify cloudflared
+      - name: Download locked cloudflared asset
         shell: bash
         env:
-          CLOUDFLARED_VERSION: ${{ steps.versions.outputs.cloudflared }}
+          CLOUDFLARED_REPOSITORY: ${{ steps.versions.outputs.cloudflared_repository }}
+          CLOUDFLARED_VERSION: ${{ steps.versions.outputs.cloudflared_version }}
           CLOUDFLARED_ASSET: ${{ matrix.cloudflared }}
           TARGET_OS: ${{ matrix.goos }}
         run: |
           set -euo pipefail
-          metadata="$(curl -fsSL --retry 3 "https://api.github.com/repos/cloudflare/cloudflared/releases/tags/$CLOUDFLARED_VERSION")"
-          url="$(jq -r --arg name "$CLOUDFLARED_ASSET" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$metadata")"
-          digest="$(jq -r --arg name "$CLOUDFLARED_ASSET" '.assets[] | select(.name == $name) | .digest // empty' <<<"$metadata")"
-          test -n "$url"
-          curl -fsSL --retry 3 "$url" -o "/tmp/$CLOUDFLARED_ASSET"
-          if [[ "$digest" != sha256:* ]]; then
-            echo "cloudflared asset has no SHA-256 digest" >&2
-            exit 1
-          fi
-          expected="${digest#sha256:}"
-          actual="$(sha256sum "/tmp/$CLOUDFLARED_ASSET" | awk '{print $1}')"
-          test "$actual" = "$expected"
+          expected="$(python3 - "$CLOUDFLARED_ASSET" <<'PY'
+          import json, sys
+          with open('deps.lock.json', encoding='utf-8') as handle:
+              assets = json.load(handle)['cloudflared']['assets']
+          value = assets.get(sys.argv[1], '')
+          if not value:
+              raise SystemExit(f"unlocked cloudflared asset: {sys.argv[1]}")
+          print(value)
+          PY
+          )"
+          url="https://github.com/$CLOUDFLARED_REPOSITORY/releases/download/$CLOUDFLARED_VERSION/$CLOUDFLARED_ASSET"
+          download="$RUNNER_TEMP/$CLOUDFLARED_ASSET"
+          curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$download"
+          actual="$(sha256sum "$download" | awk '{print $1}')"
+          [[ "$actual" == "$expected" ]] || { echo "cloudflared checksum mismatch" >&2; exit 1; }
           if [[ "$CLOUDFLARED_ASSET" == *.tgz ]]; then
-            tar -xzf "/tmp/$CLOUDFLARED_ASSET" -C /tmp
-            cp /tmp/cloudflared stage/cloudflared
+            tar -xOzf "$download" cloudflared > stage/cloudflared
           elif [[ "$TARGET_OS" == windows ]]; then
-            cp "/tmp/$CLOUDFLARED_ASSET" stage/cloudflared.exe
+            cp "$download" stage/cloudflared.exe
           else
-            cp "/tmp/$CLOUDFLARED_ASSET" stage/cloudflared
+            cp "$download" stage/cloudflared
           fi
           chmod 755 stage/cloudflared* stage/codexlink*
 
@@ -111,7 +163,7 @@ jobs:
         run: |
           set -euo pipefail
           suffix=""
-          if [[ "$TARGET_OS" == windows ]]; then suffix=".exe"; fi
+          [[ "$TARGET_OS" == windows ]] && suffix=".exe"
           go run ./cmd/releasepack \
             --os "$TARGET_OS" \
             --arch "$TARGET_ARCH" \
@@ -119,7 +171,7 @@ jobs:
             --codexlink "stage/codexlink${suffix}" \
             --cloudflared "stage/cloudflared${suffix}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
@@ -129,11 +181,10 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: package-*
           path: dist
@@ -147,7 +198,7 @@ jobs:
           git archive --format=tar.gz --prefix="codexlink-${version}/" -o dist/codexlink-source.tar.gz HEAD
           sha256sum dist/codexlink-source.tar.gz | sed 's#dist/##' > dist/codexlink-source.tar.gz.sha256
 
-      - name: Publish GitHub release
+      - name: Publish immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -155,7 +206,11 @@ jobs:
           set -euo pipefail
           version="$(tr -d '\r\n' < VERSION)"
           tag="v${version}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$GITHUB_SHA" --title "CodexLink ${version}" --generate-notes
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; refusing to mutate published assets" >&2
+            exit 1
           fi
-          gh release upload "$tag" dist/* --clobber
+          gh release create "$tag" dist/* \
+            --verify-tag \
+            --title "CodexLink ${version}" \
+            --generate-notes
