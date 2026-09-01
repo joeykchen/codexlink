@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joeykchen/codexlink/internal/auth"
 	"github.com/joeykchen/codexlink/internal/buildinfo"
 	"github.com/joeykchen/codexlink/internal/setupui"
 )
@@ -88,9 +89,11 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 			"port": s.Port, "publicUrl": nullableString(s.PublicURL()), "tunnel": s.Tunnel.Status(),
 			"tokenCount": s.AuthStore.TokenCountForAudience(audience), "tokenRecordCount": s.AuthStore.TokenCount(),
 			"pairingActive": s.Pairing.Active(), "audience": audience,
-			"pid": os.Getpid(), "startedAt": s.startedAt.Format(time.RFC3339Nano),
+			"controlResponseAuthorized": s.AuthStore.HasActiveScopeForAudience(audience, auth.ScopeControlRespond),
+			"pid":                       os.Getpid(), "startedAt": s.startedAt.Format(time.RFC3339Nano),
 		})
 	})))
+	s.registerControlAdmin(mux)
 	mux.Handle("/admin/tunnel/start", s.adminOnly(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			adminMethod(response, http.MethodPost)

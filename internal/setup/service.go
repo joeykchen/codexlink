@@ -30,34 +30,36 @@ type CodexIntegration struct {
 }
 
 type Result struct {
-	WorkspaceID           string                 `json:"workspaceId"`
-	WorkspaceName         string                 `json:"workspaceName"`
-	WorkspaceRoot         string                 `json:"workspaceRoot"`
-	WorkspaceMode         workspace.TopologyMode `json:"workspaceMode"`
-	RepositoryCount       int                    `json:"repositoryCount"`
-	Spawned               bool                   `json:"spawned"`
-	Port                  int                    `json:"port"`
-	PublicURL             string                 `json:"publicUrl,omitempty"`
-	MCPURL                string                 `json:"mcpUrl"`
-	ConnectorName         string                 `json:"connectorName"`
-	ConnectorAction       string                 `json:"connectorAction"`
-	Authorized            bool                   `json:"authorized"`
-	AuthorizationRequired bool                   `json:"authorizationRequired"`
-	TokenCount            int                    `json:"tokenCount"`
-	PairingCode           string                 `json:"pairingCode,omitempty"`
-	PairingExpiresAt      int64                  `json:"pairingExpiresAt,omitempty"`
-	SetupURL              string                 `json:"setupUrl,omitempty"`
-	LocalOnly             bool                   `json:"localOnly"`
-	Codex                 CodexIntegration       `json:"codex"`
+	WorkspaceID               string                 `json:"workspaceId"`
+	WorkspaceName             string                 `json:"workspaceName"`
+	WorkspaceRoot             string                 `json:"workspaceRoot"`
+	WorkspaceMode             workspace.TopologyMode `json:"workspaceMode"`
+	RepositoryCount           int                    `json:"repositoryCount"`
+	Spawned                   bool                   `json:"spawned"`
+	Port                      int                    `json:"port"`
+	PublicURL                 string                 `json:"publicUrl,omitempty"`
+	MCPURL                    string                 `json:"mcpUrl"`
+	ConnectorName             string                 `json:"connectorName"`
+	ConnectorAction           string                 `json:"connectorAction"`
+	Authorized                bool                   `json:"authorized"`
+	AuthorizationRequired     bool                   `json:"authorizationRequired"`
+	TokenCount                int                    `json:"tokenCount"`
+	ControlResponseAuthorized bool                   `json:"controlResponseAuthorized"`
+	PairingCode               string                 `json:"pairingCode,omitempty"`
+	PairingExpiresAt          int64                  `json:"pairingExpiresAt,omitempty"`
+	SetupURL                  string                 `json:"setupUrl,omitempty"`
+	LocalOnly                 bool                   `json:"localOnly"`
+	Codex                     CodexIntegration       `json:"codex"`
 }
 
 type adminInfo struct {
-	PublicURL        string                 `json:"publicUrl"`
-	TokenCount       int                    `json:"tokenCount"`
-	TokenRecordCount int                    `json:"tokenRecordCount"`
-	WorkspaceMode    workspace.TopologyMode `json:"workspaceMode"`
-	RepositoryCount  int                    `json:"repositoryCount"`
-	Tunnel           struct {
+	PublicURL                 string                 `json:"publicUrl"`
+	TokenCount                int                    `json:"tokenCount"`
+	TokenRecordCount          int                    `json:"tokenRecordCount"`
+	ControlResponseAuthorized bool                   `json:"controlResponseAuthorized"`
+	WorkspaceMode             workspace.TopologyMode `json:"workspaceMode"`
+	RepositoryCount           int                    `json:"repositoryCount"`
+	Tunnel                    struct {
 		Running bool   `json:"running"`
 		URL     string `json:"url"`
 	} `json:"tunnel"`
@@ -185,11 +187,13 @@ func (s *Service) Run(ctx context.Context, options Options) (Result, error) {
 	}
 	result.ConnectorAction = config.ConnectorAction(previousMCP, &result.MCPURL)
 	result.TokenCount = info.TokenCount
+	result.ControlResponseAuthorized = info.ControlResponseAuthorized
 	if options.Reconnect || result.ConnectorAction == "update" {
 		if err := s.admin(ctx, state, http.MethodPost, "/admin/revoke-all", nil, nil); err != nil {
 			return Result{}, err
 		}
 		result.TokenCount = 0
+		result.ControlResponseAuthorized = false
 	}
 	result.Authorized = result.TokenCount > 0
 	result.AuthorizationRequired = options.Reconnect || !result.Authorized || result.ConnectorAction != "none"

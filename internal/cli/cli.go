@@ -82,6 +82,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		return a.commandSession(args[1:])
 	case "record":
 		return a.commandRecord(args[1:])
+	case "control":
+		return a.commandControl(ctx, args[1:])
 	case "tunnel":
 		return a.commandTunnel(ctx, args[1:])
 	default:
@@ -116,6 +118,7 @@ Advanced commands:
   session         Manage saved ChatGPT conversation metadata
   tunnel          Configure Cloudflare quick/named tunnels
   record          Append a local execution summary for independent review
+  control         Prepare and receive structured planning/review responses
 
 Examples:
   codexlink
@@ -291,7 +294,7 @@ func (a *App) commandSetup(ctx context.Context, args []string) int {
 		"publicUrl": emptyNil(result.PublicURL), "mcpUrl": result.MCPURL,
 		"connectorName": result.ConnectorName, "connectorAction": result.ConnectorAction,
 		"authorized": result.Authorized, "authorizationRequired": result.AuthorizationRequired,
-		"tokenCount": result.TokenCount, "setupPageOpened": opened,
+		"tokenCount": result.TokenCount, "controlResponseAuthorized": result.ControlResponseAuthorized, "setupPageOpened": opened,
 		"localOnly": result.LocalOnly, "codex": result.Codex,
 	}
 	if result.AuthorizationRequired {

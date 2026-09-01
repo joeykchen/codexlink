@@ -17,6 +17,7 @@ import (
 	"github.com/joeykchen/codexlink/internal/auth"
 	"github.com/joeykchen/codexlink/internal/buildinfo"
 	"github.com/joeykchen/codexlink/internal/config"
+	"github.com/joeykchen/codexlink/internal/control"
 	"github.com/joeykchen/codexlink/internal/logging"
 	"github.com/joeykchen/codexlink/internal/mcp"
 	stateruntime "github.com/joeykchen/codexlink/internal/runtime"
@@ -43,6 +44,7 @@ type Server struct {
 	AdminToken      string
 	PublicRef       string
 	AuthStore       *auth.Store
+	ControlStore    *control.Store
 	Pairing         *auth.PairingManager
 	Tunnel          tunnel.Provider
 	SetupUI         *setupui.Manager
@@ -136,6 +138,14 @@ func Start(options Options) (*Server, error) {
 		}
 		return nil, err
 	}
+	controlStore, err := control.NewStore(config.StateDir(), ws.ID, ws.Root)
+	if err != nil {
+		_ = listener.Close()
+		if ownsLogger {
+			_ = logger.Close()
+		}
+		return nil, err
+	}
 	pairing := auth.NewPairingManager(ws.ID, auth.PairingOptions{TTL: options.PairingTTL})
 	tunnelState, err := tunnel.ReadState(ws.ID)
 	if err != nil {
@@ -172,7 +182,7 @@ func Start(options Options) (*Server, error) {
 
 	server := &Server{
 		Workspace: ws, Host: host, Port: actualPort, AdminToken: adminToken, PublicRef: publicRef,
-		AuthStore: store, Pairing: pairing, Tunnel: provider,
+		AuthStore: store, ControlStore: controlStore, Pairing: pairing, Tunnel: provider,
 		TopologyMode: topologyMode, RepositoryCount: len(repositories),
 		logger: logger, ownsLogger: ownsLogger, listener: listener,
 		startedAt: time.Now().UTC(), done: make(chan struct{}), lockPath: lockPath,
@@ -204,7 +214,7 @@ func Start(options Options) (*Server, error) {
 	mux.Handle("/setup/", server.SetupUI)
 	oauthServer := auth.NewOAuthServer(store, pairing, ws.Name, server.baseURL, logger)
 	oauthServer.Register(mux)
-	registry, err := mcp.WorkspaceTools(ws)
+	registry, err := mcp.WorkspaceTools(ws, controlStore)
 	if err != nil {
 		_ = listener.Close()
 		if ownsLogger {

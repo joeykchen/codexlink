@@ -41,7 +41,7 @@ codexlink
 
 ## 首次连接 ChatGPT
 
-本机安装与启动已经自动化，但 **ChatGPT 必须由账号所有者对新的 MCP App 完成一次安全确认**。该确认用于核对工作区、只读权限和 OAuth 授权，CodexLink 不会绕过登录、验证码、两步验证或授权确认。
+本机安装与启动已经自动化，但 **ChatGPT 必须由账号所有者对新的 MCP App 完成一次安全确认**。该确认用于核对工作区、仓库只读权限、受限的临时控制响应权限和 OAuth 授权，CodexLink 不会绕过登录、验证码、两步验证或授权确认。
 
 每个工作区首次连接时：
 
@@ -61,7 +61,7 @@ codexlink
 4. 点击 `Scan Tools`。
 5. ChatGPT 打开 CodexLink 授权页后：
    - 确认工作区名称正确；
-   - 确认请求的是只读权限；
+   - 确认仓库访问保持只读，`control.respond` 仅用于有界、短期的工作流响应；
    - 输入 Setup 页面中的一次性配对码；
    - 点击连接或授权。
 6. 回到 ChatGPT，等待工具扫描完成。确认只读工具已经出现后，点击 `Create`。
@@ -107,6 +107,15 @@ execution_summary
 公网 MCP 不提供写文件、删除文件、Shell、安装依赖、Git 提交或 Push 能力。
 
 ## 常用命令
+
+仓库读取始终只读。`submit_control_response` 仅能填写一个由本地预创建、位于仓库外且会过期的工作流响应槽，不能修改文件或执行命令：
+
+```sh
+codexlink control prepare --task-id cl_deadbeef --iteration 0 --json
+codexlink control wait --request-id cr_... --task-id cl_deadbeef --iteration 0 --timeout 90m --json
+```
+
+协议和安全边界见 [`docs/control-response.md`](docs/control-response.md)。
 
 ```sh
 codexlink          # 幂等地安装配置、启动或复用服务

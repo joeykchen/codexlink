@@ -29,7 +29,7 @@ codexlink
 
 ## First-time ChatGPT confirmation
 
-Local installation and startup are automated, but **the ChatGPT account owner must approve each new MCP app once**. This confirmation verifies the workspace, read-only permissions, and OAuth authorization. CodexLink never bypasses sign-in, CAPTCHA, two-factor authentication, or an authorization prompt.
+Local installation and startup are automated, but **the ChatGPT account owner must approve each new MCP app once**. This confirmation verifies the workspace, repository-read-only permissions, and OAuth authorization. CodexLink never bypasses sign-in, CAPTCHA, two-factor authentication, or an authorization prompt.
 
 For the first connection of each workspace:
 
@@ -49,7 +49,7 @@ For the first connection of each workspace:
 4. Click `Scan Tools`.
 5. When ChatGPT opens the CodexLink authorization page:
    - verify the workspace name;
-   - verify that the requested permissions are read-only;
+   - verify repository access is read-only and `control.respond` is limited to bounded ephemeral workflow responses;
    - enter the one-time pairing code;
    - approve the connection.
 6. Return to ChatGPT and wait for the tool scan to finish. Confirm that the read-only tools are present, then click `Create`.
@@ -72,10 +72,11 @@ ChatGPT custom-app availability and UI can change. See OpenAI's current [Develop
 
 ```text
 ChatGPT -- OAuth + MCP --> CodexLink -- read-only --> workspace
+                         CodexLink -- ephemeral --> control state
 Codex   ---------------- edit / shell / test ------> workspace
 ```
 
-One workspace directory is one authorization boundary. The bridge currently exposes these read-only tools:
+One workspace directory is one authorization boundary. The bridge exposes these repository read-only tools:
 
 - `workspace_info`
 - `list_directory`
@@ -90,7 +91,9 @@ One workspace directory is one authorization boundary. The bridge currently expo
 - `test_status`
 - `execution_summary`
 
-No public tool can write files, execute commands, install packages, commit, or push.
+It also exposes `submit_control_response`, which can fill one locally prepared, expiring response slot outside the repository. It cannot create slots, read responses, modify files, or execute commands.
+
+No public tool can write repository files, execute commands, install packages, commit, or push. See [`docs/control-response.md`](docs/control-response.md) for the structured workflow and security limits.
 
 ## Common commands
 

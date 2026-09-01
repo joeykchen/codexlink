@@ -25,5 +25,6 @@ Do not include real tokens, pairing codes, private repository contents, personal
 - CIMD SSRF, redirect, DNS-rebinding, or metadata-confusion flaws;
 - raw credential persistence or log leakage;
 - command execution through Git, search, browser opening, or tunnel input;
-- any remote file-write or shell capability;
+- any remote repository file-write or shell capability;
+- bypass of prepared-slot, scope, expiry, replay, or size checks for ephemeral control responses;
 - cryptographic randomness or token-family replay failures.

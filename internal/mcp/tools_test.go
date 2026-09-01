@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/joeykchen/codexlink/internal/auth"
+	"github.com/joeykchen/codexlink/internal/control"
 	"github.com/joeykchen/codexlink/internal/logging"
 	"github.com/joeykchen/codexlink/internal/workspace"
 )
@@ -25,7 +26,8 @@ func TestWorkspaceToolDefinitionsMatchGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	ws, _ := workspace.New(t.TempDir())
-	registry, _ := WorkspaceTools(ws)
+	controls, _ := control.NewStore(t.TempDir(), ws.ID, ws.Root)
+	registry, _ := WorkspaceTools(ws, controls)
 	actualDefinitions := registry.List(nil)
 	actualData, _ := json.Marshal(actualDefinitions)
 	var actual any

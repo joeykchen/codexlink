@@ -713,7 +713,8 @@ button{width:100%;margin-top:14px;padding:13px;border:0;border-radius:12px;backg
 </style>
 </head>
 <body><main>
-<h1>Authorize a read-only workspace connection</h1>
+<h1>Authorize a workspace connection</h1>
+<p class="muted">Repository access remains read-only. The control-response permission can submit only bounded, ephemeral workflow responses outside the repository.</p>
 <p class="muted">A client is requesting access to <strong>{{.WorkspaceName}}</strong>. It may:</p>
 <ul>{{range .Scopes}}<li>{{scopeLabel .}}</li>{{end}}</ul>
 <form method="post" action="/oauth/authorize">
@@ -735,11 +736,12 @@ func renderPairingPage(data pairingPageData) string {
 
 func scopeLabel(scope string) string {
 	labels := map[string]string{
-		"workspace.read":   "Read non-sensitive files and project metadata",
-		"workspace.search": "Search text inside the workspace",
-		"git.read":         "Inspect Git status and safe diffs",
-		"execution.read":   "Read local execution and test summaries",
-		"offline_access":   "Refresh the connection without re-pairing",
+		"workspace.read":    "Read non-sensitive files and project metadata",
+		"workspace.search":  "Search text inside the workspace",
+		"git.read":          "Inspect Git status and safe diffs",
+		"execution.read":    "Read local execution and test summaries",
+		ScopeControlRespond: "Submit bounded ephemeral planning/review responses",
+		"offline_access":    "Refresh the connection without re-pairing",
 	}
 	if label := labels[scope]; label != "" {
 		return label

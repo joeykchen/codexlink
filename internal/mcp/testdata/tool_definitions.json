@@ -363,6 +363,43 @@
     }
   },
   {
+    "name": "submit_control_response",
+    "title": "Submit workflow control response",
+    "description": "Fill one locally prepared, bounded, expiring workflow response slot. This writes only ephemeral CodexLink control state outside the repository; it cannot modify files or execute commands.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "iteration": {"maximum": 1000000, "minimum": 0, "type": "integer"},
+        "plan": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "description": {"maxLength": 2048, "minLength": 1, "type": "string"},
+              "files": {"items": {"maxLength": 512, "type": "string"}, "maxItems": 32, "type": "array"},
+              "tests": {"items": {"maxLength": 1024, "type": "string"}, "maxItems": 16, "type": "array"}
+            },
+            "required": ["description"],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "request_id": {"pattern": "^cr_[A-Za-z0-9_-]{32}$", "type": "string"},
+        "state": {"enum": ["PLAN", "DONE", "BLOCKED", "ERROR"], "type": "string"},
+        "summary": {"maxLength": 4096, "minLength": 1, "type": "string"},
+        "task_id": {"pattern": "^cl_[0-9a-f]{8}$", "type": "string"}
+      },
+      "required": ["request_id", "task_id", "iteration", "state", "summary"],
+      "type": "object"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
     "name": "test_status",
     "title": "Latest test status",
     "description": "Return the most recent execution record produced by the local coding harness. The tool reads a record and never launches tests.",

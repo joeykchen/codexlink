@@ -34,6 +34,7 @@ var SupportedScopes = []string{
 	"workspace.search",
 	"git.read",
 	"execution.read",
+	ScopeControlRespond,
 	"offline_access",
 }
 
@@ -45,7 +46,10 @@ var DefaultScopes = []string{
 	"workspace.search",
 	"git.read",
 	"execution.read",
+	ScopeControlRespond,
 }
+
+const ScopeControlRespond = "control.respond"
 
 const (
 	defaultMaxClients            = 256
@@ -684,6 +688,24 @@ func (s *Store) TokenCountForAudience(audience string) int {
 		}
 	}
 	return count
+}
+
+// HasActiveScopeForAudience reports whether a current token explicitly grants
+// scope for the canonical MCP audience. It never upgrades an existing grant.
+func (s *Store) HasActiveScopeForAudience(audience, scope string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := s.now().UnixMilli()
+	for _, token := range s.tokens {
+		if token.ExpiresAt > now && sameResource(token.Audience, audience) {
+			for _, granted := range token.Scopes {
+				if granted == scope {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (s *Store) RevokeAudience(audience string) (int, error) {

@@ -97,6 +97,40 @@ func TestStorePKCEResourceBindingRefreshRotationAndReplayRevocation(t *testing.T
 	}
 }
 
+func TestControlRespondScopeIsExplicitAndDoesNotUpgradeOldGrant(t *testing.T) {
+	defaults, err := ParseScopes("")
+	if err != nil || !containsScope(defaults, ScopeControlRespond) {
+		t.Fatalf("defaults=%v err=%v", defaults, err)
+	}
+	old, err := ParseScopes("workspace.read offline_access")
+	if err != nil || containsScope(old, ScopeControlRespond) {
+		t.Fatalf("old scopes=%v err=%v", old, err)
+	}
+	store, err := NewStore("w", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json"), AccessTokenTTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, _ := store.RegisterClient("old", []string{"http://127.0.0.1/callback"})
+	verifier := strings.Repeat("c", 64)
+	audience := "https://example.test/mcp"
+	code, _ := store.CreateAuthorizationCode(AuthorizationCodeRequest{ClientID: client.ID, RedirectURI: client.RedirectURIs[0], CodeChallenge: PKCEChallenge(verifier), Scopes: old, PairingID: "p", Audience: audience, RefreshAllowed: true})
+	tokens, err := store.ExchangeAuthorizationCode(code, client.ID, client.RedirectURIs[0], verifier, audience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.HasActiveScopeForAudience(audience, ScopeControlRespond) {
+		t.Fatal("old grant gained control scope")
+	}
+	rotated, err := store.Refresh(tokens.RefreshToken, client.ID, audience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := store.VerifyAccess(rotated.AccessToken, audience)
+	if err != nil || containsScope(principal.Scopes, ScopeControlRespond) {
+		t.Fatalf("refresh upgraded scopes: %+v err=%v", principal, err)
+	}
+}
+
 func TestAuthorizationCodeIsSingleUseAndRedirectBound(t *testing.T) {
 	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
 	if err != nil {
