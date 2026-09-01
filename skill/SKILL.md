@@ -47,7 +47,7 @@ Workspace topology controls Git review:
 
 - `directory`: file listing, reads, and search are available, but no Git repository is selected;
 - `single-repository`: Git tools may omit `repository`;
-- `repository-group`: file listing, reads, and search cover the whole parent workspace, while every `git_status` and `git_diff` call must pass the exact workspace-relative `repository` value returned by `workspace_info`. Review every changed repository independently. Never guess a repository name from a folder label.
+- `repository-group`: file listing, reads, and search cover the whole parent workspace, while every `git_status`, `git_diff`, and `git_log` call must pass the exact workspace-relative `repository` value returned by `workspace_info`. Review every changed repository independently. Never guess a repository name from a folder label.
 
 `relations` are best-effort dependency hints, not authorization grants. They may guide planning, but current code and Git state remain authoritative.
 
@@ -73,12 +73,12 @@ When it is true and a browser tool is available:
 4. Create or replace one app using the exact `connectorName` and `mcpUrl` returned by CodexLink.
 5. Select OAuth authentication and start tool discovery.
 6. When the CodexLink authorization page appears, enter `pairingCode` there. Never send the code as a chat message.
-7. Save the app and verify that its tools are visible.
+7. Save the app and verify that its tools are visible. After a CodexLink upgrade, scan the saved endpoint again so ChatGPT refreshes cached tool definitions; this does not require re-pairing when the endpoint and OAuth grant remain valid.
 8. Poll `codexlink status --json` until the bridge reports at least one live token record.
 
 When browser setup is blocked by login, CAPTCHA, two-factor authentication, workspace permissions, or a mandatory confirmation, ask the user to perform only that action, then resume automatically.
 
-When no browser tool is available, tell the user to open `setupUrl` once and follow its four steps. Continue after `codexlink status --json` shows authorization.
+When no browser tool is available, tell the user to open `setupUrl` once and follow the displayed setup steps. Continue after `codexlink status --json` shows authorization.
 
 Use this recovery order when setup fails:
 
@@ -116,6 +116,16 @@ codexlink session set \
 ```
 
 Do not select another workspace's app. If the app's `workspace_info` result does not match the current workspace name and expected workspace reference, stop and repair the selection before sharing any task.
+
+For efficient inspection, prefer this bounded sequence when the task needs it:
+
+1. call `workspace_info` to establish identity and repository topology;
+2. call `find_files` to locate candidates without reading their content;
+3. call `file_outline` for Go declarations or Markdown headings;
+4. call `read_files` for the exact bounded ranges needed;
+5. call `git_log` only for metadata reachable from the current `HEAD`.
+
+Use `read_file`, `list_directory`, `search_workspace`, `git_status`, and `git_diff` when their focused result is the better fit. Never ask for arbitrary revisions or historical file contents; CodexLink deliberately does not expose them.
 
 ## 4. Establish the control contract
 

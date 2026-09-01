@@ -64,7 +64,7 @@ codexlink
    - 确认请求的是只读权限；
    - 输入 Setup 页面中的一次性配对码；
    - 点击连接或授权。
-6. 回到 ChatGPT，等待工具扫描完成。确认出现八个只读工具后，点击 `Create`。
+6. 回到 ChatGPT，等待工具扫描完成。确认只读工具已经出现后，点击 `Create`。
 7. 在 Plugins 页面打开刚创建的 CodexLink App，点击 `Try in chat`。如果新会话默认进入 Work，切换到 `Chat`；CodexLink App 会继续挂载在该会话中。然后发送：
 
 ```text
@@ -87,15 +87,19 @@ ChatGPT -- OAuth + MCP --> CodexLink -- 只读 --> 工作区
 Codex   --------------- 修改/命令/测试 -----> 工作区
 ```
 
-一个工作区目录就是一个授权边界。ChatGPT 可以调用八个只读工具：
+一个工作区目录就是一个授权边界。ChatGPT 当前可以调用以下只读工具：
 
 ```text
 workspace_info
 list_directory
 read_file
 search_workspace
+find_files
+read_files
+file_outline
 git_status
 git_diff
+git_log
 test_status
 execution_summary
 ```
@@ -113,18 +117,6 @@ codexlink unpair   # 撤销当前工作区的授权
 codexlink stop     # 停止当前工作区服务
 ```
 
-## 两轮重构
-
-### 第一轮：统一可移植发布模型
-
-平台名称、可执行文件名称、Cloudflare 资产名称、归档格式、归档安全检查、确定性打包和 SHA-256 生成全部集中到 `internal/distribution`。发布流程和安装器不再各自维护平台判断逻辑。
-
-### 第二轮：自包含、一步式安装
-
-部署单元从“源码 + 用户手工安装平台依赖”改为“CodexLink + cloudflared 的平台发布包”。Unix 与 Windows 安装器共享同一资产命名约定，执行校验、原子替换、PATH 配置和依赖修复，并在安装后直接进入工作区引导。
-
-详细设计见 [`docs/installation.md`](docs/installation.md) 和 [`docs/engineering/refactor-log.md`](docs/engineering/refactor-log.md)。
-
 ## 源码开发
 
 普通用户不需要 Go。贡献者可以执行：
@@ -134,5 +126,7 @@ make check
 make build
 make install-dev
 ```
+
+安全问题请按 [`SECURITY.md`](SECURITY.md) 私下报告；参与开发请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 CodexLink 是独立社区项目，不是 OpenAI 官方产品。

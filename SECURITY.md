@@ -27,5 +27,3 @@ Do not include real tokens, pairing codes, private repository contents, personal
 - command execution through Git, search, browser opening, or tunnel input;
 - any remote file-write or shell capability;
 - cryptographic randomness or token-family replay failures.
-
-See [`docs/security.md`](docs/security.md) for the complete threat model.

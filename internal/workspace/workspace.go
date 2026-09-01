@@ -1,7 +1,6 @@
 package workspace
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unicode/utf8"
 )
 
 type ErrorCode string
@@ -34,6 +32,8 @@ const (
 	ErrRepositoryNeeded  ErrorCode = "REPOSITORY_REQUIRED"
 	ErrRepositoryMissing ErrorCode = "REPOSITORY_NOT_FOUND"
 	ErrRepositoryLimit   ErrorCode = "REPOSITORY_LIMIT_EXCEEDED"
+	ErrInvalidArgument   ErrorCode = "INVALID_ARGUMENT"
+	ErrUnsupportedType   ErrorCode = "UNSUPPORTED_FILE_TYPE"
 )
 
 type Error struct {
@@ -250,183 +250,6 @@ func (w *Workspace) Resolve(requested string, allowSensitive bool) (absolute, re
 		return "", "", NewError(ErrSensitiveFile, "'%s' is blocked by the sensitive-file policy", rel)
 	}
 	return canonical, rel, nil
-}
-
-type ReadFileOptions struct {
-	StartLine int
-	EndLine   int
-	MaxLines  int
-	MaxBytes  int
-}
-
-type ReadFileResult struct {
-	Path           string `json:"path"`
-	SizeBytes      int64  `json:"sizeBytes"`
-	TotalLines     int    `json:"totalLines"`
-	StartLine      int    `json:"startLine"`
-	EndLine        int    `json:"endLine"`
-	Truncated      bool   `json:"truncated"`
-	RemainingLines int    `json:"remainingLines"`
-	NextStartLine  *int   `json:"nextStartLine"`
-	Content        string `json:"content"`
-}
-
-const (
-	defaultMaxLines = 400
-	hardMaxLines    = 2000
-	defaultMaxBytes = 256 * 1024
-	hardMaxBytes    = 1024 * 1024
-)
-
-func (w *Workspace) ReadFile(requested string, options ReadFileOptions) (ReadFileResult, error) {
-	absolute, relative, err := w.Resolve(requested, false)
-	if err != nil {
-		return ReadFileResult{}, err
-	}
-	info, err := os.Stat(absolute)
-	if errors.Is(err, os.ErrNotExist) {
-		return ReadFileResult{}, NewError(ErrFileNotFound, "file not found: %s", relative)
-	}
-	if err != nil {
-		return ReadFileResult{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return ReadFileResult{}, NewError(ErrNotFile, "not a regular file: %s", relative)
-	}
-	binary, err := isBinary(absolute)
-	if err != nil {
-		return ReadFileResult{}, err
-	}
-	if binary {
-		return ReadFileResult{}, NewError(ErrBinaryFile, "binary file (%d bytes): %s", info.Size(), relative)
-	}
-	start := options.StartLine
-	if start < 1 {
-		start = 1
-	}
-	maxLines := options.MaxLines
-	if maxLines < 1 {
-		maxLines = defaultMaxLines
-	}
-	if maxLines > hardMaxLines {
-		maxLines = hardMaxLines
-	}
-	end := options.EndLine
-	if end < start {
-		end = start + maxLines - 1
-	}
-	if end > start+hardMaxLines-1 {
-		end = start + hardMaxLines - 1
-	}
-	maxBytes := options.MaxBytes
-	if maxBytes < 1024 {
-		maxBytes = defaultMaxBytes
-	}
-	if maxBytes > hardMaxBytes {
-		maxBytes = hardMaxBytes
-	}
-
-	file, err := os.Open(absolute)
-	if err != nil {
-		return ReadFileResult{}, err
-	}
-	defer file.Close()
-	reader := bufio.NewReaderSize(file, 64*1024)
-	selected := make([]string, 0, maxLines)
-	total := 0
-	actualEnd := start - 1
-	bytesUsed := 0
-	byteTruncated := false
-	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			total++
-			line = strings.TrimSuffix(line, "\n")
-			line = strings.TrimSuffix(line, "\r")
-			if total >= start && total <= end && !byteTruncated {
-				cost := len([]byte(line))
-				if len(selected) > 0 {
-					cost++
-				}
-				if bytesUsed+cost <= maxBytes {
-					selected = append(selected, line)
-					bytesUsed += cost
-					actualEnd = total
-				} else if len(selected) == 0 {
-					prefix := utf8SafePrefix([]byte(line), maxBytes)
-					selected = append(selected, string(prefix))
-					bytesUsed = len(prefix)
-					actualEnd = total
-					byteTruncated = true
-				} else {
-					byteTruncated = true
-				}
-			}
-		}
-		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) {
-				return ReadFileResult{}, readErr
-			}
-			break
-		}
-	}
-	remaining := total - actualEnd
-	if remaining < 0 {
-		remaining = 0
-	}
-	var next *int
-	if remaining > 0 || byteTruncated {
-		value := actualEnd + 1
-		if byteTruncated && len(selected) == 1 && actualEnd == start {
-			// A single overlong line cannot be resumed by line number. Report no
-			// continuation rather than returning the same line forever.
-			value = 0
-		}
-		if value > 0 {
-			next = &value
-		}
-	}
-	return ReadFileResult{
-		Path:           relative,
-		SizeBytes:      info.Size(),
-		TotalLines:     total,
-		StartLine:      start,
-		EndLine:        actualEnd,
-		Truncated:      remaining > 0 || byteTruncated,
-		RemainingLines: remaining,
-		NextStartLine:  next,
-		Content:        strings.Join(selected, "\n"),
-	}, nil
-}
-
-func utf8SafePrefix(data []byte, limit int) []byte {
-	if len(data) <= limit {
-		return data
-	}
-	end := limit
-	for end > 0 && !utf8.Valid(data[:end]) {
-		end--
-	}
-	return data[:end]
-}
-
-func isBinary(path string) (bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-	buffer := make([]byte, 8192)
-	count, err := file.Read(buffer)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	for _, value := range buffer[:count] {
-		if value == 0 {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 type DirectoryEntry struct {

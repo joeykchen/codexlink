@@ -52,7 +52,7 @@ For the first connection of each workspace:
    - verify that the requested permissions are read-only;
    - enter the one-time pairing code;
    - approve the connection.
-6. Return to ChatGPT and wait for the tool scan to finish. Confirm that the eight read-only tools are present, then click `Create`.
+6. Return to ChatGPT and wait for the tool scan to finish. Confirm that the read-only tools are present, then click `Create`.
 7. Open the created CodexLink app from the Plugins page and choose `Try in chat`. If ChatGPT opens the new conversation in Work, switch it to `Chat`; the CodexLink app remains attached. Then send:
 
 ```text
@@ -75,14 +75,18 @@ ChatGPT -- OAuth + MCP --> CodexLink -- read-only --> workspace
 Codex   ---------------- edit / shell / test ------> workspace
 ```
 
-One workspace directory is one authorization boundary. The bridge exposes eight read-only tools:
+One workspace directory is one authorization boundary. The bridge currently exposes these read-only tools:
 
 - `workspace_info`
 - `list_directory`
 - `read_file`
 - `search_workspace`
+- `find_files`
+- `read_files`
+- `file_outline`
 - `git_status`
 - `git_diff`
+- `git_log`
 - `test_status`
 - `execution_summary`
 
@@ -109,6 +113,6 @@ make build
 make install-dev
 ```
 
-Architecture, protocol, security, installation, and operations documents live under [`docs/`](docs/).
+Security issues should follow [`SECURITY.md`](SECURITY.md). Contribution guidelines are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 CodexLink is an independent community project and is not an official OpenAI product.
