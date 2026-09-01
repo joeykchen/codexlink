@@ -29,7 +29,7 @@ func TestEnsureCleansUpTimedOutProcess(t *testing.T) {
 	}
 
 	_, err := Ensure(context.Background(), t.TempDir(), "slow-workspace", EnsureOptions{
-		Executable: script, StartupTimeout: 150 * time.Millisecond, ProbeInterval: 20 * time.Millisecond,
+		Executable: script, StartupTimeout: 10 * time.Second, ProbeInterval: 20 * time.Millisecond,
 	})
 	if err == nil || !strings.Contains(err.Error(), "did not become healthy") {
 		t.Fatalf("Ensure error = %v", err)

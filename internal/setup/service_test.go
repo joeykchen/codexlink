@@ -3,6 +3,7 @@ package setup
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	"github.com/joeykchen/codexlink/internal/config"
@@ -12,9 +13,13 @@ import (
 func TestServiceRunsOneCommandWorkflow(t *testing.T) {
 	t.Setenv("CODEXLINK_STATE_DIR", t.TempDir())
 	root := t.TempDir()
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	service := New()
 	service.ensure = func(_ context.Context, workspaceRoot, workspaceID string, options stateruntime.EnsureOptions) (stateruntime.EnsureResult, error) {
-		if workspaceRoot != root || workspaceID == "" || options.Port != 49000 {
+		if workspaceRoot != realRoot || workspaceID == "" || options.Port != 49000 {
 			t.Fatalf("unexpected ensure args: %q %q %+v", workspaceRoot, workspaceID, options)
 		}
 		return stateruntime.EnsureResult{State: stateruntime.State{WorkspaceID: workspaceID, WorkspaceRoot: workspaceRoot, Port: 49000, AdminToken: "test"}, Spawned: true}, nil

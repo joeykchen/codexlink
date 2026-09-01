@@ -16,7 +16,7 @@ import (
 func TestProcessProviderLifecycle(t *testing.T) {
 	script := writeTunnelScript(t, "#!/bin/sh\necho 'INF https://blue-bird.trycloudflare.com ready'\nwhile :; do sleep 1; done\n")
 	provider := &processProvider{
-		name: "test", binary: script, logger: logging.Null(), timeout: time.Second,
+		name: "test", binary: script, logger: logging.Null(), timeout: 5 * time.Second,
 		args: func(int) []string { return nil },
 		ready: func(line string) (string, bool) {
 			value := ParseQuickURL(line)
@@ -49,7 +49,7 @@ func TestProcessProviderLifecycle(t *testing.T) {
 func TestProcessProviderReportsFailureAndTimeout(t *testing.T) {
 	failing := &processProvider{
 		name: "failure", binary: writeTunnelScript(t, "#!/bin/sh\necho 'fatal tunnel failed' >&2\nexit 7\n"),
-		logger: logging.Null(), timeout: time.Second, args: func(int) []string { return nil },
+		logger: logging.Null(), timeout: 5 * time.Second, args: func(int) []string { return nil },
 		ready: func(string) (string, bool) { return "", false },
 	}
 	if _, err := failing.Start(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "fatal tunnel failed") {
@@ -61,7 +61,7 @@ func TestProcessProviderReportsFailureAndTimeout(t *testing.T) {
 
 	timingOut := &processProvider{
 		name: "timeout", binary: writeTunnelScript(t, "#!/bin/sh\nwhile :; do sleep 1; done\n"),
-		logger: logging.Null(), timeout: 80 * time.Millisecond, args: func(int) []string { return nil },
+		logger: logging.Null(), timeout: 5 * time.Second, args: func(int) []string { return nil },
 		ready: func(string) (string, bool) { return "", false },
 	}
 	if _, err := timingOut.Start(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "timed out") {

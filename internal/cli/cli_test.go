@@ -58,6 +58,10 @@ func TestVersionUnknownAndFlagErrors(t *testing.T) {
 
 func TestLocalStateCommandsRoundTrip(t *testing.T) {
 	root := t.TempDir()
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	stateDir := filepath.Join(t.TempDir(), "state")
 	codexHome := filepath.Join(t.TempDir(), "codex")
 	t.Setenv("HOME", t.TempDir())
@@ -92,7 +96,7 @@ func TestLocalStateCommandsRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected live bridge: %#v", status)
 	}
 	workspaceInfo := mustJSON(append([]string{"workspace"}, workspaceArgs...)...)
-	if workspaceInfo["root"] != root {
+	if workspaceInfo["root"] != realRoot {
 		t.Fatalf("workspace root = %#v", workspaceInfo["root"])
 	}
 	mustJSON("tunnel", "status", "--workspace", root, "--json")
