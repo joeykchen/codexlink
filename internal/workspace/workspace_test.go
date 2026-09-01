@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -319,6 +320,92 @@ func TestRepositoryMetadataCannotEscapeWorkspace(t *testing.T) {
 	_, err = ws.Repositories()
 	if workspaceErrorCode(err) != ErrOutsideWorkspace {
 		t.Fatalf("external gitdir error = %v", err)
+	}
+}
+
+func TestRepositoryAllowsValidatedLinkedWorktreeMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	mainRepository := filepath.Join(root, "main")
+	worktree := filepath.Join(root, "linked")
+	if err := os.MkdirAll(mainRepository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, mainRepository, "init", "-q")
+	gitRun(t, mainRepository, "config", "user.email", "codexlink@example.invalid")
+	gitRun(t, mainRepository, "config", "user.name", "CodexLink Test")
+	writeTestFile(t, mainRepository, "README.md", "linked worktree\n")
+	gitRun(t, mainRepository, "add", "README.md")
+	gitRun(t, mainRepository, "commit", "-q", "-m", "initial")
+	gitRun(t, mainRepository, "worktree", "add", "-q", "-b", "linked-test", worktree)
+
+	ws, err := New(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := ws.Repositories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalWorktree, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryInfo, statErr := os.Stat(repositories[0].Root)
+	canonicalInfo, canonicalStatErr := os.Stat(canonicalWorktree)
+	if len(repositories) != 1 || statErr != nil || canonicalStatErr != nil || !os.SameFile(repositoryInfo, canonicalInfo) {
+		t.Fatalf("repositories = %#v", repositories)
+	}
+}
+
+func TestRepositoryRejectsForgedLinkedWorktreeMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses POSIX-style metadata paths")
+	}
+	for _, test := range []struct {
+		name   string
+		layout string
+		common string
+	}{
+		{name: "non-standard layout", layout: "admin/not-worktrees/id", common: "../.."},
+		{name: "workspace common directory", layout: "admin/worktrees/id", common: "WORKSPACE"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			repository := filepath.Join(root, "repo")
+			gitDir := filepath.Join(t.TempDir(), filepath.FromSlash(test.layout))
+			if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(repository, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(repository, ".git")
+			writeTestFile(t, repository, ".git", "gitdir: "+filepath.ToSlash(gitDir)+"\n")
+			if err := os.WriteFile(filepath.Join(gitDir, "gitdir"), []byte(filepath.ToSlash(marker)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			common := test.common
+			if common == "WORKSPACE" {
+				common = repository
+			}
+			if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(filepath.ToSlash(common)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ws, err := New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ws.Repositories()
+			if workspaceErrorCode(err) != ErrOutsideWorkspace {
+				t.Fatalf("forged metadata error = %v", err)
+			}
+			if strings.Contains(fmt.Sprint(err), filepath.Dir(gitDir)) {
+				t.Fatalf("error leaks external metadata path: %v", err)
+			}
+		})
 	}
 }
 

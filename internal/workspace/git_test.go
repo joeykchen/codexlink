@@ -22,6 +22,74 @@ func gitRun(t *testing.T, root string, args ...string) string {
 	return string(output)
 }
 
+func createLinkedWorktree(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	mainRepository := filepath.Join(root, "main")
+	worktree := filepath.Join(root, "linked")
+	if err := os.MkdirAll(mainRepository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, mainRepository, "init", "-q")
+	gitRun(t, mainRepository, "config", "user.email", "codexlink@example.invalid")
+	gitRun(t, mainRepository, "config", "user.name", "CodexLink Test")
+	writeTestFile(t, mainRepository, "README.md", "before\n")
+	gitRun(t, mainRepository, "add", "README.md")
+	gitRun(t, mainRepository, "commit", "-q", "-m", "initial")
+	gitRun(t, mainRepository, "worktree", "add", "-q", "-b", "linked-test", worktree)
+	return mainRepository, worktree
+}
+
+func TestGitLinkedWorktreeReadOnlyOperations(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	_, worktree := createLinkedWorktree(t)
+	writeTestFile(t, worktree, "README.md", "after\n")
+	ws, err := New(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := ws.GitInfoFor(context.Background(), "")
+	if err != nil || !info.IsRepo {
+		t.Fatalf("info=%#v err=%v", info, err)
+	}
+	status, err := ws.GitStatus(context.Background())
+	if err != nil || len(status.Unstaged) != 1 {
+		t.Fatalf("status=%#v err=%v", status, err)
+	}
+	diff, err := ws.GitDiff(context.Background(), GitDiffOptions{Mode: DiffUnstaged})
+	if err != nil || !strings.Contains(diff.Diff, "after") {
+		t.Fatalf("diff=%#v err=%v", diff, err)
+	}
+	log, err := ws.GitLog(context.Background(), GitLogOptions{Limit: 1})
+	if err != nil || len(log.Commits) != 1 {
+		t.Fatalf("log=%#v err=%v", log, err)
+	}
+}
+
+func TestGitLinkedWorktreeRevalidatesCachedMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	mainRepository, worktree := createLinkedWorktree(t)
+	ws, err := New(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws.Repositories(); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	alternates := filepath.Join(mainRepository, ".git", "objects", "info", "alternates")
+	if err := os.WriteFile(alternates, []byte(filepath.ToSlash(outside)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws.GitStatus(context.Background()); workspaceErrorCode(err) != ErrOutsideWorkspace {
+		t.Fatalf("cached metadata bypass error = %v", err)
+	}
+}
+
 func TestGitStatusAndDiffRedactSensitivePaths(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

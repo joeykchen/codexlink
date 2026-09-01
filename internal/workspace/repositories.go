@@ -88,7 +88,14 @@ func (w *Workspace) repositoryMarker(root string) (bool, error) {
 		return false, NewError(ErrInvalidConfig, "Git metadata directory is not a directory for %s", filepath.ToSlash(root))
 	}
 	if !w.contains(realGitDir) {
-		return false, NewError(ErrOutsideWorkspace, "Git metadata for %s resolves outside the workspace", filepath.ToSlash(root))
+		commonDir, linkedErr := validateLinkedWorktreeMetadata(marker, realGitDir)
+		if linkedErr != nil {
+			return false, NewError(ErrOutsideWorkspace, "Git metadata for %s resolves outside the workspace", filepath.ToSlash(root))
+		}
+		if err := validateGitAlternates(w, filepath.Join(commonDir, "objects")); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 
 	commonDir, err := resolveGitCommonDir(realGitDir)
@@ -102,6 +109,53 @@ func (w *Workspace) repositoryMarker(root string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func validateLinkedWorktreeMetadata(marker, gitDir string) (string, error) {
+	markerInfo, err := os.Lstat(marker)
+	if err != nil || !markerInfo.Mode().IsRegular() || markerInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("invalid worktree marker")
+	}
+	if filepath.Base(filepath.Dir(gitDir)) != "worktrees" {
+		return "", fmt.Errorf("invalid worktree metadata layout")
+	}
+	expectedCommonDir := filepath.Dir(filepath.Dir(gitDir))
+	expectedInfo, err := os.Stat(expectedCommonDir)
+	if err != nil || !expectedInfo.IsDir() {
+		return "", fmt.Errorf("invalid common directory")
+	}
+	data, err := readBoundedRegularFile(filepath.Join(gitDir, "gitdir"), 8*1024)
+	if err != nil {
+		return "", fmt.Errorf("invalid linked-worktree backlink")
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" || strings.ContainsRune(value, '\x00') || strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("invalid linked-worktree backlink")
+	}
+	backlink := filepath.FromSlash(value)
+	if !filepath.IsAbs(backlink) {
+		backlink = filepath.Join(gitDir, backlink)
+	}
+	backlinkInfo, err := os.Stat(backlink)
+	if err != nil {
+		return "", fmt.Errorf("invalid linked-worktree backlink")
+	}
+	if !os.SameFile(markerInfo, backlinkInfo) {
+		return "", fmt.Errorf("linked-worktree backlink mismatch")
+	}
+	commonDir, err := resolveGitCommonDir(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid linked-worktree common directory")
+	}
+	commonInfo, err := os.Stat(commonDir)
+	if err != nil || !os.SameFile(expectedInfo, commonInfo) {
+		return "", fmt.Errorf("linked-worktree common directory mismatch")
+	}
+	objectsInfo, err := os.Lstat(filepath.Join(commonDir, "objects"))
+	if err != nil || !objectsInfo.IsDir() || objectsInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("invalid linked-worktree object directory")
+	}
+	return commonDir, nil
 }
 
 func resolveGitCommonDir(gitDir string) (string, error) {
@@ -416,6 +470,13 @@ func (w *Workspace) InspectTopology(ctx context.Context) (Topology, error) {
 		topology.DefaultRepository = &value
 	}
 	for _, repository := range repositories {
+		marked, markerErr := w.repositoryMarker(repository.Root)
+		if markerErr != nil {
+			return Topology{}, markerErr
+		}
+		if !marked {
+			return Topology{}, NewError(ErrRepositoryMissing, "repository %q has no .git marker", repository.Path)
+		}
 		gitInfo := w.gitInfoForRepository(ctx, repository)
 		topology.Repositories = append(topology.Repositories, RepositorySummary{
 			Path: repository.Path, Name: repository.Name,

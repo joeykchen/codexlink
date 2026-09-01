@@ -236,6 +236,13 @@ func (w *Workspace) selectGitRepository(selector string) (Repository, bool, erro
 	if err != nil {
 		return Repository{}, false, err
 	}
+	marked, err := w.repositoryMarker(repository.Root)
+	if err != nil {
+		return Repository{}, false, err
+	}
+	if !marked {
+		return Repository{}, false, NewError(ErrRepositoryMissing, "repository %q has no .git marker", repository.Path)
+	}
 	return repository, true, nil
 }
 
