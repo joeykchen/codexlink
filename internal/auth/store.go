@@ -63,6 +63,8 @@ type Client struct {
 	GrantTypes              []string `json:"grantTypes,omitempty"`
 	ResponseTypes           []string `json:"responseTypes,omitempty"`
 	ApplicationType         string   `json:"applicationType,omitempty"`
+	JWKSURI                 string   `json:"jwksUri,omitempty"`
+	TokenEndpointSigningAlg string   `json:"tokenEndpointSigningAlg,omitempty"`
 	CreatedAt               string   `json:"createdAt"`
 }
 
@@ -347,6 +349,8 @@ func (s *Store) RegisterClientMetadata(metadata ClientMetadata) (Client, error) 
 		GrantTypes:              metadata.GrantTypes,
 		ResponseTypes:           metadata.ResponseTypes,
 		ApplicationType:         metadata.ApplicationType,
+		JWKSURI:                 metadata.JWKSURI,
+		TokenEndpointSigningAlg: metadata.TokenEndpointAuthSigningAlg,
 		CreatedAt:               s.now().UTC().Format(time.RFC3339Nano),
 	}
 	s.mu.Lock()

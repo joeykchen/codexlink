@@ -29,6 +29,9 @@ func TestManagerServesOnlyLocalExpiringSessions(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(body, "CodexLink · demo") || !strings.Contains(body, "ABCD-EFGH") {
 		t.Fatalf("setup page = %d %s", response.Code, body)
 	}
+	if !strings.Contains(body, "Try in chat") || !strings.Contains(body, "switch to <strong>Chat</strong>") {
+		t.Fatalf("regular Chat handoff is missing: %s", body)
+	}
 	if strings.Contains(body, "demo <repo>") || !strings.Contains(body, "demo &lt;repo&gt;") {
 		t.Fatalf("workspace name was not escaped: %s", body)
 	}

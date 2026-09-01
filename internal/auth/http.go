@@ -41,19 +41,27 @@ type PendingAuthorization struct {
 	ExpiresAt      time.Time
 }
 
+type completedAuthorization struct {
+	Location  string
+	ExpiresAt time.Time
+}
+
 type OAuthServer struct {
-	store            *Store
-	pairing          *PairingManager
-	workspaceName    string
-	baseURL          BaseURLFunc
-	logger           *logging.Logger
-	metadataResolver ClientMetadataResolver
-	mu               sync.Mutex
-	pending          map[string]PendingAuthorization
-	now              func() time.Time
-	limits           OAuthLimits
-	registerLimiter  *requestLimiter
-	authorizeLimiter *requestLimiter
+	store             *Store
+	pairing           *PairingManager
+	workspaceName     string
+	baseURL           BaseURLFunc
+	logger            *logging.Logger
+	metadataResolver  ClientMetadataResolver
+	mu                sync.Mutex
+	pending           map[string]PendingAuthorization
+	completed         map[string]completedAuthorization
+	assertionVerifier ClientAssertionVerifier
+	assertionJTIs     map[string]time.Time
+	now               func() time.Time
+	limits            OAuthLimits
+	registerLimiter   *requestLimiter
+	authorizeLimiter  *requestLimiter
 }
 
 type OAuthServerOption func(*OAuthServer)
@@ -70,13 +78,19 @@ func WithOAuthLimits(limits OAuthLimits) OAuthServerOption {
 	return func(server *OAuthServer) { server.limits = normalizeOAuthLimits(limits) }
 }
 
+func WithClientAssertionVerifier(verifier ClientAssertionVerifier) OAuthServerOption {
+	return func(server *OAuthServer) { server.assertionVerifier = verifier }
+}
+
 func NewOAuthServer(store *Store, pairing *PairingManager, workspaceName string, baseURL BaseURLFunc, logger *logging.Logger, options ...OAuthServerOption) *OAuthServer {
 	if logger == nil {
 		logger = logging.Null()
 	}
 	server := &OAuthServer{
 		store: store, pairing: pairing, workspaceName: workspaceName, baseURL: baseURL, logger: logger,
-		metadataResolver: NewHTTPClientMetadataResolver(), pending: make(map[string]PendingAuthorization), now: time.Now,
+		metadataResolver: NewHTTPClientMetadataResolver(), pending: make(map[string]PendingAuthorization),
+		completed: make(map[string]completedAuthorization), now: time.Now,
+		assertionVerifier: NewChatGPTAssertionVerifier(), assertionJTIs: make(map[string]time.Time),
 		limits: defaultOAuthLimits(),
 	}
 	for _, option := range options {
@@ -116,19 +130,20 @@ func (s *OAuthServer) authorizationMetadata(response http.ResponseWriter, reques
 	}
 	base := strings.TrimRight(s.baseURL(request), "/")
 	writeJSON(response, http.StatusOK, map[string]any{
-		"issuer":                                         base,
-		"authorization_endpoint":                         base + "/oauth/authorize",
-		"token_endpoint":                                 base + "/oauth/token",
-		"registration_endpoint":                          base + "/oauth/register",
-		"revocation_endpoint":                            base + "/oauth/revoke",
-		"response_types_supported":                       []string{"code"},
-		"response_modes_supported":                       []string{"query"},
-		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":               []string{"S256"},
-		"token_endpoint_auth_methods_supported":          []string{"none"},
-		"client_id_metadata_document_supported":          true,
-		"authorization_response_iss_parameter_supported": true,
-		"scopes_supported":                               SupportedScopes,
+		"issuer":                                           base,
+		"authorization_endpoint":                           base + "/oauth/authorize",
+		"token_endpoint":                                   base + "/oauth/token",
+		"registration_endpoint":                            base + "/oauth/register",
+		"revocation_endpoint":                              base + "/oauth/revoke",
+		"response_types_supported":                         []string{"code"},
+		"response_modes_supported":                         []string{"query"},
+		"grant_types_supported":                            []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":                 []string{"S256"},
+		"token_endpoint_auth_methods_supported":            []string{"none", "private_key_jwt"},
+		"token_endpoint_auth_signing_alg_values_supported": []string{"RS256"},
+		"client_id_metadata_document_supported":            true,
+		"authorization_response_iss_parameter_supported":   true,
+		"scopes_supported":                                 SupportedScopes,
 	})
 }
 
@@ -226,6 +241,11 @@ func (s *OAuthServer) prunePendingLocked() {
 	for id, pending := range s.pending {
 		if !now.Before(pending.ExpiresAt) {
 			delete(s.pending, id)
+		}
+	}
+	for id, completed := range s.completed {
+		if !now.Before(completed.ExpiresAt) {
+			delete(s.completed, id)
 		}
 	}
 }
@@ -328,14 +348,20 @@ func (s *OAuthServer) authorizeComplete(response http.ResponseWriter, request *h
 	s.mu.Lock()
 	s.prunePendingLocked()
 	pending, ok := s.pending[requestID]
-	s.mu.Unlock()
 	if !ok {
+		completed, completedOK := s.completed[requestID]
+		s.mu.Unlock()
+		if completedOK {
+			writeAuthorizationRedirect(response, completed.Location)
+			return
+		}
 		secureHTMLHeaders(response)
 		http.Error(response, "This authorization request expired. Start the connection again.", http.StatusBadRequest)
 		return
 	}
 	verdict := s.pairing.Verify(request.Form.Get("pairing_code"), ClientIP(request))
 	if !verdict.OK {
+		s.mu.Unlock()
 		message := pairingFailureMessage(verdict)
 		status := http.StatusGone
 		if verdict.Failure == PairingInvalid {
@@ -347,14 +373,12 @@ func (s *OAuthServer) authorizeComplete(response http.ResponseWriter, request *h
 		_, _ = io.WriteString(response, renderPairingPage(pairingPageData{RequestID: requestID, WorkspaceName: s.workspaceName, Scopes: pending.Scopes, Error: message}))
 		return
 	}
-	s.mu.Lock()
-	delete(s.pending, requestID)
-	s.mu.Unlock()
 	code, err := s.store.CreateAuthorizationCode(AuthorizationCodeRequest{
 		ClientID: pending.ClientID, RedirectURI: pending.RedirectURI, CodeChallenge: pending.CodeChallenge,
 		Scopes: pending.Scopes, PairingID: verdict.SessionID, Audience: pending.Audience, RefreshAllowed: pending.RefreshAllowed,
 	})
 	if err != nil {
+		s.mu.Unlock()
 		http.Error(response, "authorization service unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -366,8 +390,32 @@ func (s *OAuthServer) authorizeComplete(response http.ResponseWriter, request *h
 	}
 	values.Set("iss", strings.TrimRight(s.baseURL(request), "/"))
 	location.RawQuery = values.Encode()
+	redirect := location.String()
+	delete(s.pending, requestID)
+	// Browsers can submit the authorization form twice while the first redirect
+	// is still loading. Briefly replay the same redirect instead of reporting
+	// that the already-successful request expired.
+	s.completed[requestID] = completedAuthorization{Location: redirect, ExpiresAt: s.now().Add(time.Minute)}
+	s.mu.Unlock()
 	s.logger.Info("pairing accepted for OAuth client %s", pending.ClientID)
-	http.Redirect(response, request, location.String(), http.StatusFound)
+	// The pairing page uses an HTML navigation response because some embedded
+	// authorization windows do not follow a cross-site redirect after POST.
+	writeAuthorizationRedirect(response, redirect)
+}
+
+func writeAuthorizationRedirect(response http.ResponseWriter, location string) {
+	// Return a navigation document instead of relying only on a cross-site 3xx
+	// after POST. The callback still receives the normal OAuth query response.
+	response.Header().Set("Cache-Control", "no-store")
+	response.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+	response.Header().Set("Referrer-Policy", "no-referrer")
+	response.Header().Set("X-Content-Type-Options", "nosniff")
+	response.Header().Set("X-Frame-Options", "DENY")
+	response.Header().Set("Content-Type", "text/html; charset=utf-8")
+	response.Header().Set("Location", location)
+	response.WriteHeader(http.StatusOK)
+	escaped := template.HTMLEscapeString(location)
+	_, _ = fmt.Fprintf(response, `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=%s"><title>Continue to ChatGPT</title></head><body><p>Authorization approved.</p><p><a href="%s">Continue to ChatGPT</a></p></body></html>`, escaped, escaped)
 }
 
 func (s *OAuthServer) token(response http.ResponseWriter, request *http.Request) {
@@ -377,13 +425,27 @@ func (s *OAuthServer) token(response http.ResponseWriter, request *http.Request)
 	}
 	parameters, err := parseOAuthParameters(response, request)
 	if err != nil {
+		s.logger.Warn("OAuth token request parsing failed: %v", err)
 		oauthError(response, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	clientID := parameters.Get("client_id")
+	if clientID == "" {
+		clientID = clientAssertionIssuer(parameters.Get("client_assertion"))
+		if clientID != "" {
+			parameters.Set("client_id", clientID)
+		}
+	}
+	client, assertionJTI, err := s.authenticateTokenClient(request, parameters, clientID)
+	if err != nil {
+		s.logger.Warn("OAuth token client authentication failed for %s: %v", clientID, err)
+		oauthError(response, http.StatusUnauthorized, "invalid_client", "client authentication failed")
 		return
 	}
 	grantType := parameters.Get("grant_type")
 	switch grantType {
 	case "authorization_code":
-		code, verifier, clientID := parameters.Get("code"), parameters.Get("code_verifier"), parameters.Get("client_id")
+		code, verifier := parameters.Get("code"), parameters.Get("code_verifier")
 		redirectURI := parameters.Get("redirect_uri")
 		if code == "" || verifier == "" || clientID == "" || redirectURI == "" {
 			oauthError(response, http.StatusBadRequest, "invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
@@ -391,25 +453,86 @@ func (s *OAuthServer) token(response http.ResponseWriter, request *http.Request)
 		}
 		set, exchangeErr := s.store.ExchangeAuthorizationCode(code, clientID, redirectURI, verifier, parameters.Get("resource"))
 		if exchangeErr != nil {
+			s.logger.Warn("OAuth authorization code exchange failed for %s: %v", client.ID, exchangeErr)
 			oauthError(response, oauthStatus(exchangeErr), oauthCode(exchangeErr), "authorization code exchange failed")
 			return
 		}
+		s.recordAssertionJTI(client.ID, assertionJTI)
 		writeTokenSet(response, set)
+		s.logger.Info("issued OAuth tokens to client %s", client.ID)
 	case "refresh_token":
-		refresh, clientID := parameters.Get("refresh_token"), parameters.Get("client_id")
+		refresh := parameters.Get("refresh_token")
 		if refresh == "" || clientID == "" {
 			oauthError(response, http.StatusBadRequest, "invalid_request", "refresh_token and client_id are required")
 			return
 		}
 		set, refreshErr := s.store.Refresh(refresh, clientID, parameters.Get("resource"))
 		if refreshErr != nil {
+			s.logger.Warn("OAuth refresh token exchange failed for %s: %v", client.ID, refreshErr)
 			oauthError(response, oauthStatus(refreshErr), oauthCode(refreshErr), "refresh token exchange failed")
 			return
 		}
+		s.recordAssertionJTI(client.ID, assertionJTI)
 		writeTokenSet(response, set)
+		s.logger.Info("refreshed OAuth tokens for client %s", client.ID)
 	default:
 		oauthError(response, http.StatusBadRequest, "unsupported_grant_type", "supported grants: authorization_code, refresh_token")
 	}
+}
+
+func (s *OAuthServer) authenticateTokenClient(request *http.Request, parameters url.Values, clientID string) (Client, string, error) {
+	if clientID == "" {
+		return Client{}, "", fmt.Errorf("client_id is required")
+	}
+	client, err := s.resolveClient(request.Context(), clientID)
+	if err != nil {
+		return Client{}, "", err
+	}
+	switch client.TokenEndpointAuthMethod {
+	case "", "none":
+		if parameters.Get("client_assertion") != "" {
+			return Client{}, "", fmt.Errorf("public client sent an assertion")
+		}
+		return client, "", nil
+	case "private_key_jwt":
+		if parameters.Get("client_assertion_type") != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
+			return Client{}, "", fmt.Errorf("invalid client_assertion_type")
+		}
+		assertion := parameters.Get("client_assertion")
+		if assertion == "" || s.assertionVerifier == nil {
+			return Client{}, "", fmt.Errorf("client_assertion is required")
+		}
+		audience := strings.TrimRight(s.baseURL(request), "/") + "/oauth/token"
+		jti, expiresAt, err := s.assertionVerifier.Verify(request.Context(), assertion, client, audience, s.now())
+		if err != nil {
+			return Client{}, "", err
+		}
+		key := client.ID + "\x00" + jti
+		s.mu.Lock()
+		for existing, expiry := range s.assertionJTIs {
+			if !s.now().Before(expiry) {
+				delete(s.assertionJTIs, existing)
+			}
+		}
+		_, replayed := s.assertionJTIs[key]
+		s.mu.Unlock()
+		if replayed {
+			return Client{}, "", fmt.Errorf("client assertion was replayed")
+		}
+		_ = expiresAt
+		return client, jti, nil
+	default:
+		return Client{}, "", fmt.Errorf("unsupported client authentication method")
+	}
+}
+
+func (s *OAuthServer) recordAssertionJTI(clientID, jti string) {
+	if jti == "" {
+		return
+	}
+	s.mu.Lock()
+	s.assertionJTIs[clientID+"\x00"+jti] = s.now().Add(5 * time.Minute)
+	s.mu.Unlock()
 }
 
 func (s *OAuthServer) revoke(response http.ResponseWriter, request *http.Request) {

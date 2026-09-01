@@ -50,3 +50,27 @@ func TestOpenRejectsUnsafeURL(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenWaitsForOpenerAndReturnsItsError(t *testing.T) {
+	want := errors.New("opener exited unsuccessfully")
+	called := false
+	err := open(
+		context.Background(),
+		"https://example.com/setup",
+		"darwin",
+		func(name string) (string, error) { return "/usr/bin/" + name, nil },
+		func(_ context.Context, name string, args ...string) error {
+			called = true
+			if name != "/usr/bin/open" || len(args) != 1 || args[0] != "https://example.com/setup" {
+				t.Fatalf("unexpected opener command: %q %v", name, args)
+			}
+			return want
+		},
+	)
+	if !called {
+		t.Fatal("opener was not called")
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("open error = %v, want wrapped %v", err, want)
+	}
+}

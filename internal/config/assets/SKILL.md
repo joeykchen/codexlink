@@ -90,7 +90,7 @@ codexlink restart --tunnel --json
 
 Do not revoke an existing connection unless repair requires it or the user asks.
 
-## 3. Open or create the ChatGPT work conversation
+## 3. Open or create the ChatGPT conversation
 
 Read saved conversation metadata:
 
@@ -102,7 +102,8 @@ When browser control is available:
 
 - reuse the saved chat only when `resolved.reuseSavedChat` is true;
 - otherwise open the saved Project when present, or start a fresh ChatGPT conversation;
-- select the exact CodexLink app named by the setup/session metadata;
+- select the exact CodexLink app named by the setup/session metadata. If the normal composer does not list it, open the app's Plugins detail page and choose `Try in chat`;
+- honor the user's requested surface. When regular Chat was requested but `Try in chat` opens Work, switch to Chat after the app is attached and verify that the exact CodexLink app remains selected;
 - apply the `chatgptProfile` policy;
 - after the chat is ready, save its URL and connector name:
 

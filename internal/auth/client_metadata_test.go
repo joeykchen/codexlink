@@ -66,18 +66,20 @@ func TestClientMetadataNormalization(t *testing.T) {
 	}
 }
 
-func TestClientMetadataSelectsNoneFromPluralCapabilityList(t *testing.T) {
+func TestClientMetadataSelectsPreferredPrivateKeyJWT(t *testing.T) {
 	metadata, err := (ClientMetadata{
 		ClientID:                          "https://chatgpt.com/oauth/client.json",
 		ClientName:                        "ChatGPT",
 		RedirectURIs:                      []string{"https://chatgpt.com/oauth/callback"},
 		TokenEndpointAuthMethod:           "private_key_jwt",
 		TokenEndpointAuthMethodsSupported: []string{"none", "private_key_jwt"},
+		TokenEndpointAuthSigningAlg:       "RS256",
+		JWKSURI:                           "https://chatgpt.com/oauth/jwks.json",
 	}).normalized()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metadata.TokenEndpointAuthMethod != "none" {
+	if metadata.TokenEndpointAuthMethod != "private_key_jwt" {
 		t.Fatalf("selected auth method = %q", metadata.TokenEndpointAuthMethod)
 	}
 }

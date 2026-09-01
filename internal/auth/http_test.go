@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,14 +100,28 @@ func TestOAuthHTTPFlowAndBearerMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusFound {
+	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
 		t.Fatalf("authorize complete = %d %s", response.StatusCode, body)
+	}
+	if response.Header.Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("authorize redirect content type = %q", response.Header.Get("Content-Type"))
 	}
 	location, _ := url.Parse(response.Header.Get("Location"))
 	response.Body.Close()
 	if location.Query().Get("state") != "state123" || location.Query().Get("code") == "" || location.Query().Get("iss") != server.URL {
 		t.Fatalf("unexpected redirect: %s", location)
+	}
+	duplicateRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/oauth/authorize", strings.NewReader(form.Encode()))
+	duplicateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err = client.Do(duplicateRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateLocation, _ := url.Parse(response.Header.Get("Location"))
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || duplicateLocation.String() != location.String() {
+		t.Fatalf("duplicate authorize complete = %d %s, want original redirect %s", response.StatusCode, duplicateLocation, location)
 	}
 	tokenForm := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -238,8 +253,64 @@ func TestOAuthAuthorizationAcceptsCIMDClient(t *testing.T) {
 	}
 	location, _ := url.Parse(response.Header.Get("Location"))
 	response.Body.Close()
-	if response.StatusCode != http.StatusFound || location.Query().Get("code") == "" || location.Query().Get("iss") != server.URL {
+	if response.StatusCode != http.StatusOK || location.Query().Get("code") == "" || location.Query().Get("iss") != server.URL {
 		t.Fatalf("callback = %d %s", response.StatusCode, location)
+	}
+}
+
+type acceptedAssertionVerifier struct{}
+
+func (acceptedAssertionVerifier) Verify(_ context.Context, assertion string, client Client, audience string, now time.Time) (string, time.Time, error) {
+	if assertion != "signed-assertion" || client.ID != "https://chatgpt.com/oauth/client.json" || !strings.HasSuffix(audience, "/oauth/token") {
+		return "", time.Time{}, errors.New("unexpected assertion input")
+	}
+	return "assertion-id", now.Add(time.Minute), nil
+}
+
+func TestOAuthTokenAcceptsPrivateKeyJWTClient(t *testing.T) {
+	store, err := NewStore("ws", StoreOptions{File: filepath.Join(t.TempDir(), "auth.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID := "https://chatgpt.com/oauth/client.json"
+	redirectURI := "https://chatgpt.com/connector_platform_oauth_redirect"
+	verifier := strings.Repeat("v", 64)
+	audience := "https://bridge.example/mcp"
+	code, err := store.CreateAuthorizationCode(AuthorizationCodeRequest{
+		ClientID: clientID, RedirectURI: redirectURI, CodeChallenge: PKCEChallenge(verifier),
+		Scopes: []string{"workspace.read"}, PairingID: "pair", Audience: audience,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := ClientMetadataResolverFunc(func(_ context.Context, requested string) (Client, error) {
+		return Client{ID: requested, TokenEndpointAuthMethod: "private_key_jwt"}, nil
+	})
+	oauth := NewOAuthServer(store, NewPairingManager("ws", PairingOptions{}), "demo",
+		func(*http.Request) string { return "https://bridge.example" }, logging.Null(),
+		WithClientMetadataResolver(resolver), WithClientAssertionVerifier(acceptedAssertionVerifier{}))
+	mux := http.NewServeMux()
+	oauth.Register(mux)
+
+	form := url.Values{
+		"grant_type":            {"authorization_code"},
+		"code":                  {code},
+		"code_verifier":         {verifier},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"resource":              {audience},
+		"client_assertion_type": {"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"},
+		"client_assertion":      {"signed-assertion"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://bridge.example/oauth/token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("private_key_jwt token exchange = %d %s", response.Code, response.Body.String())
+	}
+	if store.TokenCount() != 1 {
+		t.Fatalf("token count = %d, want 1", store.TokenCount())
 	}
 }
 

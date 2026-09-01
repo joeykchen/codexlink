@@ -41,6 +41,8 @@ type ClientMetadata struct {
 	ResponseTypes                     []string `json:"response_types,omitempty"`
 	TokenEndpointAuthMethod           string   `json:"token_endpoint_auth_method,omitempty"`
 	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported,omitempty"`
+	TokenEndpointAuthSigningAlg       string   `json:"token_endpoint_auth_signing_alg,omitempty"`
+	JWKSURI                           string   `json:"jwks_uri,omitempty"`
 	ApplicationType                   string   `json:"application_type,omitempty"`
 	Scope                             string   `json:"scope,omitempty"`
 }
@@ -65,22 +67,37 @@ func (m ClientMetadata) normalized() (ClientMetadata, error) {
 			return ClientMetadata{}, fmt.Errorf("invalid redirect URI: %s", redirect)
 		}
 	}
-	// ChatGPT's CIMD metadata can publish both the transition-era singular
-	// preference and the standards-track plural capability list. CodexLink is a
-	// public OAuth client server and supports only `none`; select it whenever it
-	// appears in the capability intersection rather than treating a different
-	// singular preference as binding.
+	// Prefer the client's explicit method when it is in the capability list.
+	// Current ChatGPT metadata prefers private_key_jwt while retaining `none`
+	// for authorization servers that do not support authenticated clients.
 	if len(m.TokenEndpointAuthMethodsSupported) > 0 {
-		if !containsString(m.TokenEndpointAuthMethodsSupported, "none") {
-			return ClientMetadata{}, fmt.Errorf("client does not support token endpoint authentication method none")
+		if m.TokenEndpointAuthMethod == "" {
+			if containsString(m.TokenEndpointAuthMethodsSupported, "none") {
+				m.TokenEndpointAuthMethod = "none"
+			}
 		}
-		m.TokenEndpointAuthMethod = "none"
+		if !containsString(m.TokenEndpointAuthMethodsSupported, m.TokenEndpointAuthMethod) {
+			return ClientMetadata{}, fmt.Errorf("preferred token endpoint authentication method is not supported")
+		}
 	} else {
 		if m.TokenEndpointAuthMethod == "" {
 			m.TokenEndpointAuthMethod = "none"
 		}
-		if m.TokenEndpointAuthMethod != "none" {
-			return ClientMetadata{}, fmt.Errorf("unsupported token_endpoint_auth_method: %s", m.TokenEndpointAuthMethod)
+	}
+	if m.TokenEndpointAuthMethod != "none" && m.TokenEndpointAuthMethod != "private_key_jwt" {
+		return ClientMetadata{}, fmt.Errorf("unsupported token_endpoint_auth_method: %s", m.TokenEndpointAuthMethod)
+	}
+	if m.TokenEndpointAuthMethod == "private_key_jwt" {
+		if m.TokenEndpointAuthSigningAlg != "RS256" {
+			return ClientMetadata{}, fmt.Errorf("private_key_jwt requires RS256")
+		}
+		jwks, err := parseMetadataClientID(m.JWKSURI)
+		if err != nil {
+			return ClientMetadata{}, fmt.Errorf("invalid jwks_uri: %w", err)
+		}
+		client, _ := url.Parse(m.ClientID)
+		if !strings.EqualFold(jwks.Hostname(), client.Hostname()) {
+			return ClientMetadata{}, fmt.Errorf("jwks_uri must use the client metadata host")
 		}
 	}
 	if len(m.GrantTypes) == 0 {
@@ -119,6 +136,7 @@ func (m ClientMetadata) validateBounds() error {
 		{"client_id", m.ClientID},
 		{"client_uri", m.ClientURI},
 		{"logo_uri", m.LogoURI},
+		{"jwks_uri", m.JWKSURI},
 	}
 	for _, field := range uriFields {
 		if len(field.value) > maxClientMetadataURIBytes {
@@ -163,6 +181,7 @@ func (m ClientMetadata) validateBounds() error {
 	}{
 		{"token_endpoint_auth_method", m.TokenEndpointAuthMethod},
 		{"application_type", m.ApplicationType},
+		{"token_endpoint_auth_signing_alg", m.TokenEndpointAuthSigningAlg},
 	}
 	for _, field := range scalarFields {
 		if len(field.value) > maxClientMetadataValueBytes {
@@ -372,6 +391,8 @@ func (r *HTTPClientMetadataResolver) Resolve(ctx context.Context, clientID strin
 		GrantTypes:              metadata.GrantTypes,
 		ResponseTypes:           metadata.ResponseTypes,
 		ApplicationType:         metadata.ApplicationType,
+		JWKSURI:                 metadata.JWKSURI,
+		TokenEndpointSigningAlg: metadata.TokenEndpointAuthSigningAlg,
 		CreatedAt:               nowFunc().UTC().Format(time.RFC3339Nano),
 	}
 	now = nowFunc()

@@ -53,7 +53,7 @@ For the first connection of each workspace:
    - enter the one-time pairing code;
    - approve the connection.
 6. Return to ChatGPT and wait for the tool scan to finish. Confirm that the eight read-only tools are present, then click `Create`.
-7. Start a new chat, select the CodexLink app, and send:
+7. Open the created CodexLink app from the Plugins page and choose `Try in chat`. If ChatGPT opens the new conversation in Work, switch it to `Chat`; the CodexLink app remains attached. Then send:
 
 ```text
 Call workspace_info and confirm the connected workspace.

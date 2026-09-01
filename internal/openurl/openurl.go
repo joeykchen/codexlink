@@ -11,19 +11,28 @@ import (
 )
 
 type lookPathFunc func(string) (string, error)
+type runCommandFunc func(context.Context, string, ...string) error
 
 // Open opens target in the platform's default browser without invoking a shell.
 func Open(ctx context.Context, target string) error {
+	return open(ctx, target, runtime.GOOS, exec.LookPath, func(ctx context.Context, name string, args ...string) error {
+		return exec.CommandContext(ctx, name, args...).Run()
+	})
+}
+
+func open(ctx context.Context, target, goos string, look lookPathFunc, run runCommandFunc) error {
 	parsed, err := url.Parse(strings.TrimSpace(target))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
 		return fmt.Errorf("browser URL must be an absolute HTTP(S) URL")
 	}
-	name, args, err := commandFor(runtime.GOOS, parsed.String(), exec.LookPath)
+	name, args, err := commandFor(goos, parsed.String(), look)
 	if err != nil {
 		return err
 	}
-	command := exec.CommandContext(ctx, name, args...)
-	if err := command.Start(); err != nil {
+	// Wait for the short-lived platform opener to finish. Returning immediately
+	// after Start lets the caller cancel ctx before commands such as macOS open
+	// have handed the URL to the browser, while also hiding non-zero exits.
+	if err := run(ctx, name, args...); err != nil {
 		return fmt.Errorf("open browser: %w", err)
 	}
 	return nil

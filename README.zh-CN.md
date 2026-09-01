@@ -65,7 +65,7 @@ codexlink
    - 输入 Setup 页面中的一次性配对码；
    - 点击连接或授权。
 6. 回到 ChatGPT，等待工具扫描完成。确认出现八个只读工具后，点击 `Create`。
-7. 新建对话，选择刚创建的 CodexLink App，并发送：
+7. 在 Plugins 页面打开刚创建的 CodexLink App，点击 `Try in chat`。如果新会话默认进入 Work，切换到 `Chat`；CodexLink App 会继续挂载在该会话中。然后发送：
 
 ```text
 调用 workspace_info，确认当前连接的工作区。
